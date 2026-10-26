@@ -137,6 +137,12 @@ namespace strumpack {
 
     void gpu_solve(DenseM_t& b) const;
 
+    // solve workspace (stream, handle, level info, device/pinned
+    // buffers and metadata), built on the first solve and reused while
+    // the number and size of the right-hand sides stay the same
+    struct SolveCache;
+    mutable std::unique_ptr<SolveCache> solve_cache_;
+
     using F_t::lchild_;
     using F_t::rchild_;
     using F_t::dim_sep;
