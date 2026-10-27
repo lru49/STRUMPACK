@@ -454,6 +454,18 @@ namespace strumpack {
   static inline void large_getrf_native(magma_int_t n, std::complex<double>* A, magma_int_t ld, magma_int_t* piv, magma_int_t* info)
   { magma_zgetrf_native(n, n, reinterpret_cast<magmaDoubleComplex*>(A), ld, piv, info); }
 
+
+  // F-GEMM-TOP (magma-hpc F track): Schur update of ONE large front with the fixed-size open magmablas gemm kernel
+  // (90-98 % of the FP64 peak at these sizes) instead of the vbatched kernel (60-85 % on the top levels).
+  static inline void large_gemm(magma_int_t m, magma_int_t n, magma_int_t k, const float* A, magma_int_t lda, const float* B, magma_int_t ldb, float* C, magma_int_t ldc, magma_queue_t q)
+  { magmablas_sgemm(MagmaNoTrans, MagmaNoTrans, m, n, k, -1.f, A, lda, B, ldb, 1.f, C, ldc, q); }
+  static inline void large_gemm(magma_int_t m, magma_int_t n, magma_int_t k, const double* A, magma_int_t lda, const double* B, magma_int_t ldb, double* C, magma_int_t ldc, magma_queue_t q)
+  { magmablas_dgemm(MagmaNoTrans, MagmaNoTrans, m, n, k, -1., A, lda, B, ldb, 1., C, ldc, q); }
+  static inline void large_gemm(magma_int_t m, magma_int_t n, magma_int_t k, const std::complex<float>* A, magma_int_t lda, const std::complex<float>* B, magma_int_t ldb, std::complex<float>* C, magma_int_t ldc, magma_queue_t q)
+  { magmablas_cgemm(MagmaNoTrans, MagmaNoTrans, m, n, k, MAGMA_C_MAKE(-1.f, 0.f), reinterpret_cast<const magmaFloatComplex*>(A), lda, reinterpret_cast<const magmaFloatComplex*>(B), ldb, MAGMA_C_ONE, reinterpret_cast<magmaFloatComplex*>(C), ldc, q); }
+  static inline void large_gemm(magma_int_t m, magma_int_t n, magma_int_t k, const std::complex<double>* A, magma_int_t lda, const std::complex<double>* B, magma_int_t ldb, std::complex<double>* C, magma_int_t ldc, magma_queue_t q)
+  { magmablas_zgemm(MagmaNoTrans, MagmaNoTrans, m, n, k, MAGMA_Z_MAKE(-1., 0.), reinterpret_cast<const magmaDoubleComplex*>(A), lda, reinterpret_cast<const magmaDoubleComplex*>(B), ldb, MAGMA_Z_ONE, reinterpret_cast<magmaDoubleComplex*>(C), ldc, q); }
+
   template<typename scalar_t,typename integer_t>
   struct FrontMAGMA<scalar_t,integer_t>::FactorCache {
     std::size_t N = 0, nnz = 0;
@@ -568,6 +580,19 @@ namespace strumpack {
           gpu::getrs
             (handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_,
              L.f[i]->F12_, L.dev_getrf_err+i);
+        static const int large_gemm_d2 = std::getenv("STRUM_LARGE_GEMM") ?
+          std::atoi(std::getenv("STRUM_LARGE_GEMM")) : 1024;   // 0 = off
+        if (large_gemm_d2 > 0 && L.max_d2_small > large_gemm_d2) {
+          // F-GEMM-TOP: one fixed-size gemm launch per front (levels with such fronts hold 1-250 fronts)
+          auto q = gpu::get_magma_queue(handle);
+          for (std::size_t i=0; i<Nsmall; i++) {
+            auto& f = *(L.f[i]);
+            const magma_int_t dsep = f.dim_sep(), dupd = f.dim_upd();
+            if (!dsep || !dupd) continue;
+            large_gemm(dupd, dupd, dsep, f.F21_.data(), f.F21_.ld(), f.F12_.data(), f.F12_.ld(),
+                       f.F22_.data(), f.F22_.ld(), q);
+          }
+        } else
         gpu::magma::gemm_vbatched_max_nocheck
           (MagmaNoTrans, MagmaNoTrans, d2, d2, d1, scalar_t(-1.),
            F21, ld2, F12, ld1, scalar_t(1.), F22, ld2, Nsmall,
