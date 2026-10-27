@@ -487,14 +487,11 @@ namespace strumpack {
     // F-VALCOPY: the CSR value array is page-locked in place (cudaHostRegister) so the 455 MB per-refactorization
     // upload runs at PCIe speed instead of through the driver's pageable staging; registration is kept while the
     // same host buffer (STRUMPACK keeps the permuted matrix across value updates) is passed again.
-    const void* pinned_vals = nullptr;
-    std::size_t pinned_bytes = 0;
-    bool pin_failed = false;
-    ~FactorCache() {
-#if defined(STRUMPACK_USE_CUDA)
-      if (pinned_vals) cudaHostUnregister(const_cast<void*>(pinned_vals));
-#endif
-    }
+    // v2: cudaHostRegister of A.val() in place was WRONG (window 103 arm V): STRUMPACK replaces the matrix
+    // buffer on a structure-changing update, the registration then maps freed pages and the next upload reads
+    // stale memory. Now: a STRUMPACK-owned pinned staging buffer, filled chunk by chunk (OpenMP memcpy) while the
+    // previous chunk's async DMA runs on the compute stream.
+    gpu::HostMemory<scalar_t> h_vals;    // pinned staging, nnz values
   };
 
   template<typename scalar_t,typename integer_t> ReturnCode
@@ -527,21 +524,26 @@ namespace strumpack {
     auto& C = *factor_cache_;
     gpu::Stream comp_stream;
     gpu::Handle handle(comp_stream);
-#if defined(STRUMPACK_USE_CUDA)
     {
       static const bool pin = !(std::getenv("STRUM_PIN_VALUES") &&
                                 std::atoi(std::getenv("STRUM_PIN_VALUES")) == 0);
-      const void* vp = static_cast<const void*>(A.val());
-      const std::size_t vb = C.nnz * sizeof(scalar_t);
-      if (pin && !C.pin_failed && (vp != C.pinned_vals || vb != C.pinned_bytes)) {
-        if (C.pinned_vals) { cudaHostUnregister(const_cast<void*>(C.pinned_vals)); C.pinned_vals = nullptr; }
-        if (cudaHostRegister(const_cast<void*>(vp), vb, cudaHostRegisterDefault) == cudaSuccess) {
-          C.pinned_vals = vp; C.pinned_bytes = vb;
-        } else { cudaGetLastError(); C.pin_failed = true; }
-      }
+      if (pin) {
+        if (C.h_vals.size() < C.nnz) C.h_vals = gpu::HostMemory<scalar_t>(C.nnz);
+        const scalar_t* src = A.val();
+        scalar_t* stg = C.h_vals;
+        scalar_t* dst = C.d_vals;
+        const std::size_t nchunk = 8, chunk = (C.nnz + nchunk - 1) / nchunk;
+        for (std::size_t c=0; c<nchunk; c++) {
+          const std::size_t lo = c*chunk, hi = std::min(C.nnz, lo+chunk);
+          if (lo >= hi) break;
+#pragma omp parallel for
+          for (std::size_t k=lo; k<hi; k++) stg[k] = src[k];
+          gpu::copy_host_to_device_async<scalar_t>(dst+lo, stg+lo, hi-lo, comp_stream);
+        }
+        comp_stream.synchronize();   // the gathers below run on the default stream
+      } else
+        gpu::copy_host_to_device<scalar_t>(C.d_vals, A.val(), C.nnz);
     }
-#endif
-    gpu::copy_host_to_device<scalar_t>(C.d_vals, A.val(), C.nnz);
     scalar_t* fbase = dev_factors_->template as<scalar_t>();
     for (int l=C.lvls-1; l>=0; l--) {
       auto& L = C.ldata[l];
