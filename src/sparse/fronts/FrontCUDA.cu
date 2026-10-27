@@ -630,7 +630,42 @@ namespace strumpack {
     }
 
 
+
+    /**
+     * F-GATHER (magma-hpc F track): scatter the sparse-matrix values of
+     * one level's fronts straight from the device copy of the CSR
+     * values into the (zeroed) front memory, using a gather map built
+     * once per sparsity structure: base[dst[k]] = vals[src[k]].
+     */
+    template<typename T> __global__ void
+    gather_front_elements_kernel(std::size_t n, const int* __restrict__ src,
+                                 const unsigned* __restrict__ dst,
+                                 const T* __restrict__ vals, T* base) {
+      std::size_t k = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+      if (k < n) base[dst[k]] = vals[src[k]];
+    }
+
+    template<typename T> void
+    gather_front_elements(std::size_t n, const int* src, const unsigned* dst,
+                          const T* vals, T* base) {
+      if (!n) return;
+      using T_ = typename cuda_type<T>::value_type;
+      const unsigned nt = 256;
+      const std::size_t nb = (n + nt - 1) / nt;
+      for (std::size_t b0=0; b0<nb; b0+=65535) {
+        const std::size_t bl = std::min<std::size_t>(65535, nb-b0);
+        gather_front_elements_kernel<T_><<<bl, nt>>>
+          (std::min(n - b0*nt, bl*nt), src + b0*nt, dst + b0*nt,
+           reinterpret_cast<const T_*>(vals), reinterpret_cast<T_*>(base));
+      }
+      gpu_check(cudaPeekAtLastError());
+    }
+
     // explicit template instantiations
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const float*, float*);
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const double*, double*);
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const std::complex<float>*, std::complex<float>*);
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const std::complex<double>*, std::complex<double>*);
     template void assemble(unsigned int, AssembleData<float>*, AssembleData<float>*);
     template void assemble(unsigned int, AssembleData<double>*, AssembleData<double>*);
     template void assemble(unsigned int, AssembleData<std::complex<float>>*, AssembleData<std::complex<float>>*);

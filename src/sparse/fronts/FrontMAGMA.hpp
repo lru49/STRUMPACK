@@ -129,6 +129,10 @@ namespace strumpack {
     ReturnCode
     factors_on_device(const SpMat_t& A, const Opts_t& opts,
                       std::vector<LInfo_t>& ldata, std::size_t total_dmem);
+    ReturnCode
+    factors_on_device_legacy(const SpMat_t& A, const Opts_t& opts,
+                      std::vector<LInfo_t>& ldata, std::size_t total_dmem);
+    void build_factor_cache(const SpMat_t& A, std::vector<LevelInfoMAGMA<scalar_t,integer_t>>& ldata);
 
     void fwd_solve_phase2(DenseM_t& b, DenseM_t& bupd,
                           int etree_level, int task_depth) const override;
@@ -142,6 +146,8 @@ namespace strumpack {
     // the number and size of the right-hand sides stay the same
     struct SolveCache;
     mutable std::unique_ptr<SolveCache> solve_cache_;
+    struct FactorCache;   // F-GATHER: structure cache across refactorizations (same sparsity)
+    std::unique_ptr<FactorCache> factor_cache_;
 
     using F_t::lchild_;
     using F_t::rchild_;

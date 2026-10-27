@@ -214,7 +214,7 @@ namespace strumpack {
       }
     }
 
-    void set_work_pointers(void* wmem) {
+    void set_work_pointers(void* wmem, void* batch_mem=nullptr) {
       auto schur = gpu::aligned_ptr<scalar_t>(wmem);
       for (auto F : f) {
         auto dupd = F->dim_upd();
@@ -228,7 +228,7 @@ namespace strumpack {
       auto N = f.size();
       auto imem = gpu::aligned_ptr<int>(gmem);
       dev_getrf_err = imem;    imem += N;
-      set_batch_data(imem);
+      set_batch_data(batch_mem ? batch_mem : imem);   // F-GATHER: batch meta may live in persistent memory
     }
 
     void set_batch_data(void* mem) {
@@ -428,12 +428,272 @@ namespace strumpack {
     gpu::assemble(N, hasmbl, dasmbl);
   }
 
+  // F-GATHER (magma-hpc F track, 2026-10-27): factorization structure cache.
+  // The sparse-matrix entries of every front were extracted on the host into
+  // (row,col,value) triplets and copied to the device at EVERY factorization
+  // (918 MB for the JOREK proxy), and the level meta-data (sizes, batch
+  // pointers, assembly descriptors) was rebuilt each time. A refactorization
+  // with the same sparsity (JOREK refactorizes its preconditioner every few
+  // time steps, same structure) now reuses all of it: the device buffers for
+  // factors/work/meta-data stay allocated, so every device pointer in the
+  // cached meta-data remains valid, and a per-level gather map
+  // (dst offset into the factor memory, src index into the CSR values) built
+  // once scatters the new values with one kernel per level from a single
+  // device copy of A.val(). STRUM_FACTOR_CACHE=0 restores the old path.
+  template<typename scalar_t,typename integer_t>
+  struct FrontMAGMA<scalar_t,integer_t>::FactorCache {
+    std::size_t N = 0, nnz = 0;
+    int lvls = 0;
+    std::vector<LevelInfoMAGMA<scalar_t,integer_t>> ldata;
+    std::size_t peak_work_dmem = 0, total_factor_dmem = 0, nmap = 0;
+    gpu::DeviceMemory<char> work_dmem;   // Schur complements + getrf work (two parity halves)
+    gpu::DeviceMemory<char> meta_dmem;   // per level: batch meta | AssembleData | Iptr (uploaded once)
+    gpu::HostMemory<char> meta_hmem;     // host mirror (gpu::assemble reads the host AssembleData)
+    std::vector<char*> level_factors, level_work;
+    std::vector<gpu::AssembleData<scalar_t>*> h_asmbl, d_asmbl;
+    gpu::DeviceMemory<scalar_t> d_vals;  // A.val() on the device, refreshed every factorization
+    gpu::DeviceMemory<int> d_src;        // gather map, all levels concatenated
+    gpu::DeviceMemory<unsigned> d_dst;
+    std::vector<std::size_t> map_off;    // lvls+1 offsets into d_src/d_dst
+  };
+
   template<typename scalar_t,typename integer_t> ReturnCode
   FrontMAGMA<scalar_t,integer_t>::factors_on_device
   (const SpMat_t& A, const SPOptions<scalar_t>& opts,
    std::vector<LevelInfoMAGMA<scalar_t,integer_t>>& ldata,
    std::size_t total_dmem) {
+    static const bool use_cache = !(std::getenv("STRUM_FACTOR_CACHE") &&
+                                    std::atoi(std::getenv("STRUM_FACTOR_CACHE")) == 0);
+    const bool reuse = factor_cache_ && factor_cache_->N == A.size() &&
+      factor_cache_->nnz == A.nnz();
+    if (!use_cache || (!reuse && ldata.empty()))
+      return factors_on_device_legacy(A, opts, ldata, total_dmem);
+    if (!reuse) {
+      // structure changed (or first factorization): the gather map needs
+      // 32-bit element offsets and 32-bit CSR indices
+      std::size_t total_factor_dmem = 0;
+      for (auto& L : ldata) total_factor_dmem += L.factor_bytes;
+      if (total_factor_dmem / sizeof(scalar_t) >= (std::size_t(1) << 32) ||
+          std::size_t(A.nnz()) >= (std::size_t(1) << 31)) {
+        if (opts.verbose())
+          std::cout << "# F-GATHER: problem too large for 32-bit maps, legacy path" << std::endl;
+        factor_cache_.reset();
+        return factors_on_device_legacy(A, opts, ldata, total_dmem);
+      }
+      build_factor_cache(A, ldata);
+    }
     ReturnCode err_code = ReturnCode::SUCCESS;
+    solve_cache_.reset(); // new factors: rebuild the solve workspace
+    auto& C = *factor_cache_;
+    gpu::Stream comp_stream;
+    gpu::Handle handle(comp_stream);
+    gpu::copy_host_to_device<scalar_t>(C.d_vals, A.val(), C.nnz);
+    scalar_t* fbase = dev_factors_->template as<scalar_t>();
+    for (int l=C.lvls-1; l>=0; l--) {
+      auto& L = C.ldata[l];
+      try {
+        gpu::memset<scalar_t>(C.level_work[l], 0, L.Schur_size);
+        gpu::memset<scalar_t>(C.level_factors[l], 0, L.factor_size);
+        // default stream: gather of this level's sparse entries, then extend-add
+        gpu::gather_front_elements<scalar_t>
+          (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
+           C.d_dst + C.map_off[l], C.d_vals, fbase);
+        gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l]);
+
+        std::size_t N = L.f.size(), Nsmall = L.Nsmall;
+        auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
+        auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
+        auto F11 = L.dev_F_batch;   auto F12 = F11 + Nsmall;
+        auto F21 = F12 + Nsmall;    auto F22 = F21 + Nsmall;
+
+        getrf_vbatched_chunked
+          (d1, L.max_d1_small, F11, ld1, L.dev_ipiv_batch,
+           L.dev_getrf_err, L.dev_getrf_work, &L.getrf_work_bytes,
+           Nsmall, handle);
+        for (std::size_t i=Nsmall; i<N; i++)
+          gpu::getrf
+            (handle, L.f[i]->F11_, (scalar_t*)L.dev_getrf_work,
+             L.getrf_work_bytes / sizeof(scalar_t),
+             L.f[i]->piv_, L.dev_getrf_err+i);
+        if (opts.replace_tiny_pivots()) {
+          gpu::replace_pivots_vbatched
+            (handle, d1, L.max_d1_small, F11, ld1,
+             opts.pivot_threshold(), Nsmall);
+          for (std::size_t i=Nsmall; i<N; i++)
+            gpu::replace_pivots
+              (L.f[i]->F11_.rows(), L.f[i]->F11_.data(),
+               opts.pivot_threshold());
+        }
+        gpu::laswp_fwd_vbatched
+          (handle, d2, L.max_d2_small, F12, ld1, L.dev_ipiv_batch,
+           d1, Nsmall);
+        gpu::magma::trsm_vbatched_max_nocheck
+          (MagmaLeft, MagmaLower, MagmaNoTrans, MagmaUnit,
+           L.max_d1_small, L.max_d2_small, d1, d2, scalar_t(1.),
+           F11, ld1, F12, ld1, Nsmall, handle);
+        gpu::magma::trsm_vbatched_max_nocheck
+          (MagmaLeft, MagmaUpper, MagmaNoTrans, MagmaNonUnit,
+           L.max_d1_small, L.max_d2_small, d1, d2, scalar_t(1.),
+           F11, ld1, F12, ld1, Nsmall, handle);
+        for (std::size_t i=Nsmall; i<N; i++)
+          gpu::getrs
+            (handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_,
+             L.f[i]->F12_, L.dev_getrf_err+i);
+        gpu::magma::gemm_vbatched_max_nocheck
+          (MagmaNoTrans, MagmaNoTrans, d2, d2, d1, scalar_t(-1.),
+           F21, ld2, F12, ld1, scalar_t(1.), F22, ld2, Nsmall,
+           L.max_d2_small, L.max_d2_small, L.max_d1_small, handle);
+        for (std::size_t i=Nsmall; i<N; i++)
+          gpu::gemm
+            (handle, Trans::N, Trans::N, scalar_t(-1.),
+             L.f[i]->F21_, L.f[i]->F12_, scalar_t(1.), L.f[i]->F22_);
+      } catch (const std::bad_alloc& e) {
+        std::cerr << "Out of memory" << std::endl;
+        abort();
+      }
+      long long level_flops, small_flops;
+      L.flops(level_flops, small_flops);
+      STRUMPACK_FULL_RANK_FLOPS(level_flops);
+      STRUMPACK_FLOPS(small_flops);
+    }
+    return err_code;
+  }
+
+  template<typename scalar_t,typename integer_t> void
+  FrontMAGMA<scalar_t,integer_t>::build_factor_cache
+  (const SpMat_t& A, std::vector<LevelInfoMAGMA<scalar_t,integer_t>>& ldata) {
+    factor_cache_.reset(new FactorCache());
+    auto& C = *factor_cache_;
+    C.N = A.size(); C.nnz = A.nnz(); C.lvls = ldata.size();
+    C.ldata = std::move(ldata);
+    const int lvls = C.lvls;
+    std::size_t meta_bytes = 0;
+    C.map_off.assign(lvls+1, 0);
+    for (int l=0; l<lvls; l++) {
+      auto& L = C.ldata[l];
+      std::size_t level_mem = L.work_bytes;
+      if (l+1 < lvls) level_mem += C.ldata[l+1].work_bytes;
+      C.peak_work_dmem = std::max(C.peak_work_dmem, level_mem);
+      C.total_factor_dmem += L.factor_bytes;
+      meta_bytes += L.batch_meta_bytes;
+      meta_bytes += gpu::round_up(sizeof(gpu::AssembleData<scalar_t>)*L.f.size());
+      meta_bytes += gpu::round_up(sizeof(std::size_t)*L.Isize.back());
+      C.map_off[l+1] = C.map_off[l] +
+        L.elems11.back() + L.elems12.back() + L.elems21.back();
+    }
+    C.nmap = C.map_off[lvls];
+    C.work_dmem = gpu::DeviceMemory<char>(C.peak_work_dmem);
+    dev_factors_.reset(new gpu::DeviceMemory<char>(C.total_factor_dmem));
+    C.meta_dmem = gpu::DeviceMemory<char>(meta_bytes);
+    C.meta_hmem = gpu::HostMemory<char>(meta_bytes);
+    C.d_vals = gpu::DeviceMemory<scalar_t>(C.nnz);
+    C.level_factors.assign(lvls, nullptr); C.level_work.assign(lvls, nullptr);
+    C.h_asmbl.assign(lvls, nullptr); C.d_asmbl.assign(lvls, nullptr);
+    std::vector<int> src(C.nmap);
+    std::vector<unsigned> dst(C.nmap);
+    char* factors_dptr = dev_factors_->template as<char>();
+    const scalar_t* fbase = dev_factors_->template as<scalar_t>();
+    char* meta_d = C.meta_dmem;
+    char* meta_h = C.meta_hmem;
+    const integer_t* Aptr = A.ptr();
+    const integer_t* Aind = A.ind();
+    for (int l=lvls-1; l>=0; l--) {
+      auto& L = C.ldata[l];
+      char* work_dptr = (l % 2) ? C.work_dmem.template as<char>()
+        : C.work_dmem.template as<char>() + C.peak_work_dmem - L.work_bytes;
+      C.level_work[l] = work_dptr;
+      C.level_factors[l] = factors_dptr;
+      L.set_factor_pointers(factors_dptr);
+      factors_dptr += L.factor_bytes;
+      L.set_work_pointers(work_dptr, meta_d);   // uploads the batch meta into the persistent slot
+      meta_d += L.batch_meta_bytes; meta_h += L.batch_meta_bytes;
+      const std::size_t N = L.f.size();
+      auto hasmbl = gpu::aligned_ptr<gpu::AssembleData<scalar_t>>(meta_h);
+      auto dasmbl = gpu::aligned_ptr<gpu::AssembleData<scalar_t>>(meta_d);
+      auto Iptr   = gpu::aligned_ptr<std::size_t>(hasmbl + N);
+      auto dIptr  = gpu::aligned_ptr<std::size_t>(dasmbl + N);
+      const std::size_t asm_bytes =
+        gpu::round_up(sizeof(gpu::AssembleData<scalar_t>)*N) +
+        gpu::round_up(sizeof(std::size_t)*L.Isize.back());
+      C.h_asmbl[l] = hasmbl; C.d_asmbl[l] = dasmbl;
+      const std::size_t off = C.map_off[l],
+        E11 = L.elems11.back(), E12 = L.elems12.back();
+#pragma omp parallel for
+      for (std::size_t n=0; n<N; n++) {
+        auto& f = *(L.f[n]);
+        hasmbl[n] = gpu::AssembleData<scalar_t>
+          (f.dim_sep(), f.dim_upd(), f.F11_.data(), f.F12_.data(),
+           f.F21_.data(), f.F22_.data(), 0, 0, 0, nullptr, nullptr, nullptr);
+        auto fIptr = Iptr + L.Isize[n];
+        auto fdIptr = dIptr + L.Isize[n];
+        if (f.lchild_) {
+          auto c = dynamic_cast<FM_t*>(f.lchild_.get());
+          hasmbl[n].set_ext_add_left(c->dim_upd(), c->F22_.data(), fdIptr);
+          c->upd_to_parent(&f, fIptr);
+          fIptr += c->dim_upd();
+          fdIptr += c->dim_upd();
+        }
+        if (f.rchild_) {
+          auto c = dynamic_cast<FM_t*>(f.rchild_.get());
+          hasmbl[n].set_ext_add_right(c->dim_upd(), c->F22_.data(), fdIptr);
+          c->upd_to_parent(&f, fIptr);
+        }
+        // gather map of this front (same walk as CSRMatrix::set_front_elements)
+        const integer_t slo = f.sep_begin(), shi = f.sep_end();
+        const auto& upd = f.upd();
+        const integer_t ds = shi - slo, du = upd.size();
+        const unsigned o11 = f.F11_.data() - fbase, o12 = f.F12_.data() - fbase,
+          o21 = f.F21_.data() - fbase;
+        int* s11 = src.data() + off + L.elems11[n];
+        int* s12 = src.data() + off + E11 + L.elems12[n];
+        int* s21 = src.data() + off + E11 + E12 + L.elems21[n];
+        unsigned* t11 = dst.data() + off + L.elems11[n];
+        unsigned* t12 = dst.data() + off + E11 + L.elems12[n];
+        unsigned* t21 = dst.data() + off + E11 + E12 + L.elems21[n];
+        for (integer_t row=0; row<ds; row++) {
+          integer_t upd_ptr = 0;
+          const auto hij = Aptr[row+slo+1];
+          for (integer_t j=Aptr[row+slo]; j<hij; j++) {
+            const integer_t col = Aind[j];
+            if (col >= slo) {
+              if (col < shi) { *s11++ = j; *t11++ = o11 + row + (col-slo)*ds; }
+              else {
+                while (upd_ptr<du && upd[upd_ptr]<col) upd_ptr++;
+                if (upd_ptr == du) break;
+                if (upd[upd_ptr] == col) { *s12++ = j; *t12++ = o12 + row + upd_ptr*ds; }
+              }
+            }
+          }
+        }
+        for (integer_t i=0; i<du; i++) {
+          const auto row = upd[i];
+          const auto hij = Aptr[row+1];
+          for (integer_t j=Aptr[row]; j<hij; j++) {
+            const integer_t col = Aind[j];
+            if (col >= slo) {
+              if (col < shi) { *s21++ = j; *t21++ = o21 + i + (col-slo)*du; }
+              else break;
+            }
+          }
+        }
+      }
+      gpu::copy_host_to_device<char>(reinterpret_cast<char*>(dasmbl),
+                                     reinterpret_cast<char*>(hasmbl), asm_bytes);
+      meta_d += asm_bytes; meta_h += asm_bytes;
+    }
+    C.d_src = gpu::DeviceMemory<int>(C.nmap);
+    C.d_dst = gpu::DeviceMemory<unsigned>(C.nmap);
+    gpu::copy_host_to_device<int>(C.d_src, src.data(), C.nmap);
+    gpu::copy_host_to_device<unsigned>(C.d_dst, dst.data(), C.nmap);
+  }
+
+  template<typename scalar_t,typename integer_t> ReturnCode
+  FrontMAGMA<scalar_t,integer_t>::factors_on_device_legacy
+  (const SpMat_t& A, const SPOptions<scalar_t>& opts,
+   std::vector<LevelInfoMAGMA<scalar_t,integer_t>>& ldata,
+   std::size_t total_dmem) {
+    ReturnCode err_code = ReturnCode::SUCCESS;
+    factor_cache_.reset();
     solve_cache_.reset(); // new factors: rebuild the solve workspace
     int lvls = ldata.size();
     gpu::Stream comp_stream, copy_stream;
@@ -532,14 +792,23 @@ namespace strumpack {
       L.flops(level_flops, small_flops);
       STRUMPACK_FULL_RANK_FLOPS(level_flops);
       STRUMPACK_FLOPS(small_flops);
-      // if (opts.verbose()) {
-      //   auto level_time = tl.elapsed();
-      //   std::cout << "#   GPU Factorization complete, took: "
-      //             << level_time << " seconds, "
-      //             << level_flops / 1.e9 << " GFLOPS, "
-      //             << (float(level_flops) / level_time) / 1.e9
-      //             << " GFLOP/s" << std::endl;
-      // }
+      static const bool level_info = std::getenv("STRUM_LEVEL_INFO") != nullptr;
+      if (level_info) {
+        std::size_t max_d1 = 0, max_d2 = 0, sum_d1 = 0, sum_d2 = 0;
+        double gemm_flops = 0., getrf_flops = 0., trsm_flops = 0.;
+        for (auto f : L.f) {
+          const double d1 = f->dim_sep(), d2 = f->dim_upd();
+          max_d1 = std::max<std::size_t>(max_d1, d1); max_d2 = std::max<std::size_t>(max_d2, d2);
+          sum_d1 += d1; sum_d2 += d2;
+          gemm_flops += 2. * d2 * d2 * d1; getrf_flops += 2. / 3. * d1 * d1 * d1; trsm_flops += 2. * d1 * d1 * d2;
+        }
+        std::cout << "# LEVEL_INFO level " << l << " fronts " << L.f.size() << " max_d1 " << max_d1 << " max_d2 " << max_d2
+                  << " sum_d1 " << sum_d1 << " sum_d2 " << sum_d2 << " gemm_gflop " << gemm_flops / 1e9
+                  << " getrf_gflop " << getrf_flops / 1e9 << " trsm_gflop " << trsm_flops / 1e9
+                  << " level_flops " << level_flops << " small_flops " << small_flops
+                  << " factor_MB " << L.factor_bytes / 1e6 << " work_MB " << L.work_bytes / 1e6 << " ea_MB " << L.ea_bytes / 1e6
+                  << " elems " << L.elems11.back() + L.elems12.back() + L.elems21.back() << std::endl;
+      }
     }
     return err_code;
   }
@@ -682,6 +951,11 @@ namespace strumpack {
   (const SpMat_t& A, const Opts_t& opts, VectorPool<scalar_t>& workspace,
    int etree_level, int task_depth) {
     ReturnCode err_code = ReturnCode::SUCCESS;
+    if (etree_level == 0 && factor_cache_ && factor_cache_->N == A.size() &&
+        factor_cache_->nnz == A.nnz()) {   // F-GATHER: same structure, reuse everything
+      std::vector<LInfo_t> none;
+      return factors_on_device(A, opts, none, 0);
+    }
     gpu::Stream comp_stream, copy_stream;
     gpu::Handle handle(comp_stream);
     const int lvls = this->levels();

@@ -37,6 +37,10 @@ namespace strumpack {
   namespace gpu {
 
     template<typename T> void
+    gather_front_elements(std::size_t n, const int* src, const unsigned* dst,
+                          const T* vals, T* base);
+
+    template<typename T> void
     assemble(unsigned int, AssembleData<T>*, AssembleData<T>*);
 
     template<typename T> void
