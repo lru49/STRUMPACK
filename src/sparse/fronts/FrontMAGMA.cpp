@@ -1419,9 +1419,15 @@ namespace strumpack {
     // copy rhs, from pageable memory (input)
     gpu::copy_host_to_device<scalar_t>(d_b, b);
 
+    // S-NOSYNC (magma-hpc, 2026-10-27): the per-level host-side synchronizations below are not needed for
+    // correctness: comp_stream is a blocking stream (cudaStreamCreate), so its kernels are ordered against the
+    // memsets / extend-add / extract kernels on the legacy default stream implicitly. Each host sync drained the
+    // GPU and exposed the next level's launch latency (61 syncs, ~2-4 ms of idle per solve). STRUM_SOLVE_SYNC=1
+    // restores them (A/B arm).
+    static const bool solve_sync = std::getenv("STRUM_SOLVE_SYNC") && std::atoi(std::getenv("STRUM_SOLVE_SYNC")) == 1;
     // forward solve
     for (int l=lvls-1; l>=0; l--) {
-      gpu::synchronize_default_stream();
+      if (solve_sync) gpu::synchronize_default_stream();
       auto& L = ldata[l];
       std::size_t N = L.f.size(), Nsmall = L.Nsmall;
       // batch meta-data was uploaded once, see above (L.dev_*_batch)
@@ -1434,7 +1440,7 @@ namespace strumpack {
         gpu::extend_add_rhs
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
       // TODO remove?
-      gpu::synchronize_default_stream();
+      if (solve_sync) gpu::synchronize_default_stream();
       gpu::laswp_fwd_vbatched
         (handle, nrhs_batch+Nmax-Nsmall, nrhs,
          d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
@@ -1477,7 +1483,7 @@ namespace strumpack {
                     L.f[i]->F21_, fb, scalar_t(1.), fbu);
       }
     }
-    gpu::synchronize_default_stream();
+    if (solve_sync) gpu::synchronize_default_stream();
 
 
     // backward solve
@@ -1487,7 +1493,7 @@ namespace strumpack {
       auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
       auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
       auto F12 = L.dev_F_batch + Nsmall;
-      gpu::synchronize_default_stream();
+      if (solve_sync) gpu::synchronize_default_stream();
       if (l != 0) {
         if (nrhs == 1)
           gpu::magma::gemv_vbatched_max_nocheck
