@@ -33,6 +33,7 @@
 #ifndef STRUMPACK_SPARSE_SOLVER_HPP
 #define STRUMPACK_SPARSE_SOLVER_HPP
 
+#include <algorithm>
 #include <new>
 #include <memory>
 #include <vector>
@@ -219,6 +220,21 @@ namespace strumpack {
      */
     void update_matrix_values(const CSRMatrix<scalar_t,integer_t>& A);
 
+    /**
+     * F-FP32-UPDATE (magma-hpc F track): value update from a matrix of another scalar type (the mixed-precision
+     * solver's double input into the float inner solver). With the sparsity unchanged the cast is folded into the
+     * cached gather (no intermediate cast_matrix copy); otherwise cast + the regular update path.
+     */
+    template<typename src_t>
+    void update_matrix_values_from(const CSRMatrix<src_t,integer_t>& A) {
+      if (!(mat_ && A.size() == mat_->size() && A.nnz() <= mat_->nnz())) {
+        this->print_wrong_sparsity_error();
+        return;
+      }
+      if (update_values_cached_from<src_t>(A.size(), A.ptr(), A.ind(), A.val())) return;
+      update_matrix_values(cast_matrix<src_t,integer_t,scalar_t>(A));
+    }
+
   private:
     void setup_tree() override;
     void setup_reordering() override;
@@ -242,6 +258,21 @@ namespace strumpack {
     // index-valued matrix and reused while the input structure (N, nnz, ptr, ind) is unchanged.
     // STRUM_UPDATE_CACHE=0 disables it.
     bool update_values_cached(integer_t N, const integer_t* ptr, const integer_t* ind, const scalar_t* val);
+    template<typename src_t>
+    bool update_values_cached_from(integer_t N, const integer_t* ptr, const integer_t* ind, const src_t* val) {
+      if (!upd_valid_ || !this->reordered_ || N != upd_N_ || ptr[N] != upd_ptr_[N]) return false;
+      if (!std::equal(upd_ptr_.begin(), upd_ptr_.end(), ptr) ||
+          !std::equal(upd_ind_.begin(), upd_ind_.end(), ind)) { upd_valid_ = false; return false; }
+      const std::size_t nnz = mat_->nnz();
+      auto v = mat_->val();
+      const auto map = upd_map_.data();
+#pragma omp parallel for
+      for (std::size_t k=0; k<nnz; k++)
+        v[k] = map[k] > 0 ? scalar_t(val[map[k]-1]) : scalar_t(0.);
+      this->factored_ = false;
+      return true;
+    }
+
     void build_update_cache(integer_t N, const integer_t* ptr, const integer_t* ind, bool symm_sparsity);
     std::vector<integer_t> upd_map_, upd_ptr_, upd_ind_;
     integer_t upd_N_ = 0;

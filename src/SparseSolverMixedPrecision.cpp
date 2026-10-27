@@ -26,6 +26,8 @@
  *             Division).
  */
 
+#include <cstdlib>
+#include <algorithm>
 #include "StrumpackSparseSolverMixedPrecision.hpp"
 
 #if defined(STRUMPACK_USE_PAPI)
@@ -223,6 +225,19 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> void
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   update_matrix_values(const CSRMatrix<refine_t,integer_t>& A) {
+    // F-FP32-UPDATE: same structure -> copy only the values of the outer (refine_t) matrix and let the inner
+    // solver gather+cast the new values through its update cache; otherwise the original full path.
+    static const bool fast = !(std::getenv("STRUM_MP_UPDATE") && std::atoi(std::getenv("STRUM_MP_UPDATE")) == 0);
+    if (fast && mat_.size() == A.size() && mat_.nnz() == A.nnz() &&
+        std::equal(A.ptr(), A.ptr()+A.size()+1, mat_.ptr()) &&
+        std::equal(A.ind(), A.ind()+A.nnz(), mat_.ind())) {
+      const std::size_t nnz = A.nnz();
+      auto dst = mat_.val(); auto src = A.val();
+#pragma omp parallel for
+      for (std::size_t k=0; k<nnz; k++) dst[k] = src[k];
+      solver_.template update_matrix_values_from<refine_t>(A);
+      return;
+    }
     mat_ = A;
     solver_.update_matrix_values(cast_matrix<refine_t,integer_t,factor_t>(A));
   }
