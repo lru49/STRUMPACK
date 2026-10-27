@@ -440,6 +440,20 @@ namespace strumpack {
   // (dst offset into the factor memory, src index into the CSR values) built
   // once scatters the new values with one kernel per level from a single
   // device copy of A.val(). STRUM_FACTOR_CACHE=0 restores the old path.
+
+  // F-TOPLU (magma-hpc F track): GPU-only blocked LU of ONE large front through MAGMA's native path
+  // (GPU panel kernels + open magmablas trsm/gemm in our fork). Used for levels whose fronts are taller
+  // than the fused batched panel can handle (the vbatched path then falls back to one idamax/swap/ger
+  // launch triple per column: 8448 launches for the 3200-row root of the JOREK proxy).
+  static inline void large_getrf_native(magma_int_t n, float* A, magma_int_t ld, magma_int_t* piv, magma_int_t* info)
+  { magma_sgetrf_native(n, n, A, ld, piv, info); }
+  static inline void large_getrf_native(magma_int_t n, double* A, magma_int_t ld, magma_int_t* piv, magma_int_t* info)
+  { magma_dgetrf_native(n, n, A, ld, piv, info); }
+  static inline void large_getrf_native(magma_int_t n, std::complex<float>* A, magma_int_t ld, magma_int_t* piv, magma_int_t* info)
+  { magma_cgetrf_native(n, n, reinterpret_cast<magmaFloatComplex*>(A), ld, piv, info); }
+  static inline void large_getrf_native(magma_int_t n, std::complex<double>* A, magma_int_t ld, magma_int_t* piv, magma_int_t* info)
+  { magma_zgetrf_native(n, n, reinterpret_cast<magmaDoubleComplex*>(A), ld, piv, info); }
+
   template<typename scalar_t,typename integer_t>
   struct FrontMAGMA<scalar_t,integer_t>::FactorCache {
     std::size_t N = 0, nnz = 0;
@@ -506,6 +520,21 @@ namespace strumpack {
         auto F11 = L.dev_F_batch;   auto F12 = F11 + Nsmall;
         auto F21 = F12 + Nsmall;    auto F22 = F21 + Nsmall;
 
+        static const int large_lu = std::getenv("STRUM_LARGE_LU") ?
+          std::atoi(std::getenv("STRUM_LARGE_LU")) : 1024;   // 0 = off
+        if (large_lu > 0 && L.max_d1_small > large_lu) {
+          // F-TOPLU: every front of this level individually (levels with such fronts hold 1-8 fronts)
+          std::vector<magma_int_t> piv;
+          for (std::size_t i=0; i<N; i++) {
+            auto& F11m = L.f[i]->F11_;
+            const magma_int_t n = F11m.rows();
+            if (!n) continue;
+            magma_int_t info = 0;
+            piv.resize(n);
+            large_getrf_native(n, F11m.data(), F11m.ld(), piv.data(), &info);
+            gpu::copy_host_to_device<int>(L.f[i]->piv_, piv.data(), n);
+          }
+        } else
         getrf_vbatched_chunked
           (d1, L.max_d1_small, F11, ld1, L.dev_ipiv_batch,
            L.dev_getrf_err, L.dev_getrf_work, &L.getrf_work_bytes,
