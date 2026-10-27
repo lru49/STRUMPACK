@@ -235,6 +235,17 @@ namespace strumpack {
     const Tree_t* tree() const override { return tree_.get(); }
 
     void permute_matrix_values();
+    // F-UPDATE (magma-hpc F track): value-only matrix update for a refactorization with the same sparsity.
+    // After the first update_matrix_values with matching NONE and no equilibration, the net effect of
+    // symmetrize_sparsity + permute on the values is a fixed gather (new permuted val[k] = input val[map[k]-1],
+    // 0 for the explicit zeros symmetrization adds). The map is computed once with the same code run on an
+    // index-valued matrix and reused while the input structure (N, nnz, ptr, ind) is unchanged.
+    // STRUM_UPDATE_CACHE=0 disables it.
+    bool update_values_cached(integer_t N, const integer_t* ptr, const integer_t* ind, const scalar_t* val);
+    void build_update_cache(integer_t N, const integer_t* ptr, const integer_t* ind, bool symm_sparsity);
+    std::vector<integer_t> upd_map_, upd_ptr_, upd_ind_;
+    integer_t upd_N_ = 0;
+    bool upd_valid_ = false;
 
     ReturnCode solve_internal(const scalar_t* b, scalar_t* x,
                               bool use_initial_guess=false) override;

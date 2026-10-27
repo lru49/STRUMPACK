@@ -671,7 +671,7 @@ namespace strumpack {
           for (integer_t j=Aptr[row]; j<hij; j++) {
             const integer_t col = Aind[j];
             if (col >= slo) {
-              if (col < shi) { *s21++ = j; *t21++ = o21 + i + (col-slo)*ds;   /* PLANT fact-gather-ld21: wrong leading dimension for F21 entries (du != ds) */ }
+              if (col < shi) { *s21++ = j; *t21++ = o21 + i + (col-slo)*du; }
               else break;
             }
           }

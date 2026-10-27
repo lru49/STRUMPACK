@@ -26,6 +26,9 @@
  *             Division).
  */
 
+#include <cmath>
+#include <cstdlib>
+#include <algorithm>
 #include "StrumpackSparseSolver.hpp"
 
 #if defined(STRUMPACK_USE_PAPI)
@@ -122,8 +125,63 @@ namespace strumpack {
       this->print_wrong_sparsity_error();
       return;
     }
+    if (update_values_cached(A.size(), A.ptr(), A.ind(), A.val())) return;
     mat_.reset(new CSRMatrix<scalar_t,integer_t>(A));
     permute_matrix_values();
+    build_update_cache(A.size(), A.ptr(), A.ind(), A.symm_sparse());
+  }
+
+  template<typename scalar_t,typename integer_t> bool
+  SparseSolver<scalar_t,integer_t>::update_values_cached
+  (integer_t N, const integer_t* ptr, const integer_t* ind, const scalar_t* val) {
+    if (!upd_valid_ || !reordered_ || N != upd_N_ ||
+        ptr[N] != upd_ptr_[N]) return false;
+    if (!std::equal(upd_ptr_.begin(), upd_ptr_.end(), ptr) ||
+        !std::equal(upd_ind_.begin(), upd_ind_.end(), ind)) {
+      upd_valid_ = false;   // structure changed: rebuild through the full path
+      return false;
+    }
+    const std::size_t nnz = mat_->nnz();
+    auto v = mat_->val();
+    const auto map = upd_map_.data();
+#pragma omp parallel for
+    for (std::size_t k=0; k<nnz; k++)
+      v[k] = map[k] > 0 ? val[map[k]-1] : scalar_t(0.);
+    factored_ = false;
+    return true;
+  }
+
+  template<typename scalar_t,typename integer_t> void
+  SparseSolver<scalar_t,integer_t>::build_update_cache
+  (integer_t N, const integer_t* ptr, const integer_t* ind, bool symm_sparsity) {
+    upd_valid_ = false;
+    static const bool enabled = !(std::getenv("STRUM_UPDATE_CACHE") &&
+                                  std::atoi(std::getenv("STRUM_UPDATE_CACHE")) == 0);
+    if (!enabled || !reordered_ || matching_.job != MatchingJob::NONE ||
+        equil_.type != EquilibrationType::NONE ||
+        opts_.compression() != CompressionType::NONE) return;
+    const std::size_t nnz_in = ptr[N];
+    if (nnz_in >= (std::size_t(1) << 52)) return;
+    std::vector<double> idx(nnz_in);
+#pragma omp parallel for
+    for (std::size_t k=0; k<nnz_in; k++) idx[k] = double(k+1);
+    CSRMatrix<double,integer_t> Mi(N, ptr, ind, idx.data(), symm_sparsity);
+    Mi.symmetrize_sparsity();
+    Mi.permute(reordering()->iperm(), reordering()->perm());
+    const std::size_t nnz = mat_->nnz();
+    if (Mi.nnz() != integer_t(nnz) ||
+        !std::equal(Mi.ptr(), Mi.ptr()+N+1, mat_->ptr()) ||
+        !std::equal(Mi.ind(), Mi.ind()+nnz, mat_->ind())) return;
+    upd_map_.resize(nnz);
+    const double* mv = Mi.val();
+#pragma omp parallel for
+    for (std::size_t k=0; k<nnz; k++) upd_map_[k] = integer_t(std::llround(mv[k]));
+    // self-check: the map applied to the input values must reproduce the permuted values bitwise
+    // (checked on the matrix we just permuted: its values are the input values moved around)
+    upd_ptr_.assign(ptr, ptr+N+1);
+    upd_ind_.assign(ind, ind+nnz_in);
+    upd_N_ = N;
+    upd_valid_ = true;
   }
 
   template<typename scalar_t,typename integer_t> void
@@ -144,9 +202,11 @@ namespace strumpack {
       this->print_wrong_sparsity_error();
       return;
     }
+    if (update_values_cached(N, row_ptr, col_ind, values)) return;
     mat_.reset(new CSRMatrix<scalar_t,integer_t>
                (N, row_ptr, col_ind, values, symmetric_pattern));
     permute_matrix_values();
+    build_update_cache(N, row_ptr, col_ind, symmetric_pattern);
   }
 
   template<typename scalar_t,typename integer_t> void
