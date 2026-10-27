@@ -27,7 +27,11 @@
  *
  */
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <iostream>
+#include <vector>
 
 #include "FrontMAGMA.hpp"
 #include "FrontGPUKernels.hpp"
@@ -287,9 +291,25 @@ namespace strumpack {
       max_work_mem = 0, Isize = 0;
     gpu::DeviceMemory<char> d_mem;
     gpu::HostMemory<char> h_mem;
+    // Per-level batch meta-data (LevelInfoMAGMA::set_batch_data), one
+    // private device region per level, so that it can be uploaded once
+    // per cache instead of being re-uploaded (fwd + bwd) at every solve.
+    gpu::DeviceMemory<char> d_meta;
+    std::vector<std::size_t> meta_off;
     std::vector<scalar_t**> h_rhs_batch, h_bupd_batch,
       d_rhs_batch, d_bupd_batch;
+    // Counters for STRUM_LAUNCH2_LOG / STRUM_LAUNCH2_VERIFY.
+    std::size_t n_solves = 0, n_meta_uploads = 0, n_mem_uploads = 0;
   };
+
+  // STRUM_LAUNCH2_LOG=1: print one line per solve telling whether the
+  // meta-data upload was done (cache miss) or skipped (cache hit).
+  // STRUM_LAUNCH2_VERIFY=1: additionally read the cached device
+  // meta-data back after every solve and compare it with the host copy.
+  static bool launch2_env(const char* name) {
+    const char* e = std::getenv(name);
+    return e && e[0] && e[0] != '0';
+  }
 
   template<typename scalar_t,typename integer_t>
   FrontMAGMA<scalar_t,integer_t>::FrontMAGMA
@@ -932,6 +952,18 @@ namespace strumpack {
       C.d_mem = gpu::DeviceMemory<char>(d_mem_bytes);
       C.h_mem = gpu::HostMemory<char>(h_mem_bytes);
     }
+    // Device regions for the per-level batch meta-data (one per level).
+    auto& meta_off = C.meta_off;
+    if (fresh) {
+      std::size_t meta_bytes = 0;
+      meta_off.assign(lvls, 0);
+      for (int l=0; l<lvls; l++) {
+        meta_off[l] = meta_bytes;
+        meta_bytes += gpu::round_up(ldata[l].batch_meta_bytes);
+      }
+      // + slack for the alignment inside set_batch_data
+      C.d_meta = gpu::DeviceMemory<char>(meta_bytes + gpu::round_up(1));
+    }
     auto& d_mem = C.d_mem;
     auto d_asmbl      = d_mem.template as<gpu::AssembleData<scalar_t>>();
     auto d_I          = gpu::aligned_ptr<std::size_t>(d_asmbl+Ntotal);
@@ -1008,8 +1040,24 @@ namespace strumpack {
         Ipos += L.Isize.back();
       }
     }
-    // copy all meta-data at once, from pinned memory
-    gpu::copy_host_to_device<char>(d_mem, h_mem, h_mem_bytes);
+    if (fresh) {
+      // Everything in h_mem / d_mem[0,h_mem_bytes) and the per-level batch
+      // meta-data only depends on the factorization, nrhs and the number of
+      // rows (the d_b / d_bupd pointers point into d_mem, which lives as
+      // long as this cache). The cache is dropped on refactorization
+      // (factors_on_device) and rebuilt when nrhs or rows change, so upload
+      // once here instead of at every solve.
+      // copy all meta-data at once, from pinned memory
+      gpu::copy_host_to_device<char>(d_mem, h_mem, h_mem_bytes);
+      C.n_mem_uploads++;
+      // per-level batch meta-data; set_batch_data also sets L.dev_*_batch
+      // to point into this level's private region of d_meta
+      for (int l=lvls-1; l>=0; l--) {
+        ldata[l].set_batch_data(C.d_meta.template as<char>() + meta_off[l]);
+        C.n_meta_uploads++;
+      }
+    }
+    C.n_solves++;
     // copy rhs, from pageable memory (input)
     gpu::copy_host_to_device<scalar_t>(d_b, b);
 
@@ -1018,7 +1066,7 @@ namespace strumpack {
       gpu::synchronize_default_stream();
       auto& L = ldata[l];
       std::size_t N = L.f.size(), Nsmall = L.Nsmall;
-      L.set_batch_data(dwork_mem);
+      // batch meta-data was uploaded once, see above (L.dev_*_batch)
       auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
       auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
       auto F11 = L.dev_F_batch;   auto F21 = F11 + 2*Nsmall;
@@ -1078,7 +1126,6 @@ namespace strumpack {
     for (int l=0; l<lvls; l++) {
       auto& L = ldata[l];
       std::size_t N = L.f.size(), Nsmall = L.Nsmall;
-      L.set_batch_data(dwork_mem);
       auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
       auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
       auto F12 = L.dev_F_batch + Nsmall;
@@ -1113,6 +1160,39 @@ namespace strumpack {
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
     }
     gpu::copy_device_to_host<scalar_t>(b, d_b);
+    static const bool l2log = launch2_env("STRUM_LAUNCH2_LOG");
+    static const bool l2ver = launch2_env("STRUM_LAUNCH2_VERIFY");
+    if (l2log || l2ver)
+      std::cout << "# LAUNCH2 solve " << C.n_solves << " nrhs " << nrhs
+                << " rows " << b.rows() << " cache "
+                << (fresh ? "MISS(upload)" : "HIT(no upload)")
+                << " mem_uploads " << C.n_mem_uploads << " meta_uploads "
+                << C.n_meta_uploads << std::endl;
+    if (l2ver) {
+      // read the cached device meta-data back and compare with the host
+      // copy; the one int at d_batch_int[3*(Nmax+1)] is the getrs error
+      // flag written by the device, it is not input and is skipped
+      std::vector<char> back(h_mem_bytes);
+      gpu::copy_device_to_host<char>(back.data(), d_mem, h_mem_bytes);
+      const std::size_t skip = reinterpret_cast<char*>
+        (h_batch_int + 3*(Nmax+1)) - h_mem.data();
+      std::size_t bad_mem = 0, bad_meta = 0;
+      for (std::size_t i=0; i<h_mem_bytes; i++)
+        if (!(i >= skip && i < skip+sizeof(int)) && back[i] != h_mem.data()[i])
+          bad_mem++;
+      for (int l=0; l<lvls; l++) {
+        auto& L = ldata[l];
+        std::vector<char> mb(L.batch_meta_bytes);
+        gpu::copy_device_to_host<char>
+          (mb.data(), C.d_meta.template as<char>() + meta_off[l],
+           L.batch_meta_bytes);
+        bad_meta += std::size_t(std::memcmp
+          (mb.data(), L.dev_batch_meta.data(), L.batch_meta_bytes) != 0);
+      }
+      std::cout << "# LAUNCH2 verify solve " << C.n_solves
+                << " mem_bytes_differ " << bad_mem << " levels_meta_differ "
+                << bad_meta << std::endl;
+    }
   }
 
   // explicit template instantiations
