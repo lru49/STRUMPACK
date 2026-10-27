@@ -1518,11 +1518,12 @@ namespace strumpack {
                       L.f[i]->F12_, fbu, scalar_t(1.), fb);
         }
       }
-      gpu::synchronize_default_stream();
+      if (solve_sync) gpu::synchronize_default_stream();
       if (l != lvls-1)
         gpu::extract_rhs
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
     }
+    gpu::synchronize_default_stream();   // all levels issued; the D2H copy below is on the default stream anyway
     gpu::copy_device_to_host<scalar_t>(b, d_b);
     static const bool l2log = launch2_env("STRUM_LAUNCH2_LOG");
     static const bool l2ver = launch2_env("STRUM_LAUNCH2_VERIFY");
