@@ -533,7 +533,7 @@ namespace strumpack {
         auto F21 = F12 + Nsmall;    auto F22 = F21 + Nsmall;
 
         static const int large_lu = std::getenv("STRUM_LARGE_LU") ?
-          std::atoi(std::getenv("STRUM_LARGE_LU")) : 1024;   // 0 = off
+          std::atoi(std::getenv("STRUM_LARGE_LU")) : 0;   // default OFF (window 102: +3.4 %, NO-GO); 0 = off
         if (large_lu > 0 && L.max_d1_small > large_lu) {
           // F-TOPLU: every front of this level individually (levels with such fronts hold 1-8 fronts)
           std::vector<magma_int_t> piv;
@@ -581,7 +581,7 @@ namespace strumpack {
             (handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_,
              L.f[i]->F12_, L.dev_getrf_err+i);
         static const int large_gemm_d2 = std::getenv("STRUM_LARGE_GEMM") ?
-          std::atoi(std::getenv("STRUM_LARGE_GEMM")) : 1024;   // 0 = off
+          std::atoi(std::getenv("STRUM_LARGE_GEMM")) : 0;   // default OFF (window 102: +4.2 %, NO-GO); 0 = off
         if (large_gemm_d2 > 0 && L.max_d2_small > large_gemm_d2) {
           // F-GEMM-TOP: one fixed-size gemm launch per front (levels with such fronts hold 1-250 fronts)
           auto q = gpu::get_magma_queue(handle);
