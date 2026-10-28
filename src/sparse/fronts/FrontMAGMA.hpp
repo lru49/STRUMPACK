@@ -156,11 +156,6 @@ namespace strumpack {
     mutable std::unique_ptr<SolveCache> solve_cache_;
     struct FactorCache;   // F-GATHER: structure cache across refactorizations (same sparsity)
     std::unique_ptr<FactorCache> factor_cache_;
-    // F-GRAPH: the factorization stream's completion event (waited on by the solve stream, which no longer
-    // relies on the legacy default stream for ordering) and a per-factorization counter so that the solve cache,
-    // which now survives same-structure refactorizations, re-derives its pivot permutations.
-    mutable std::unique_ptr<gpu::Event> factor_done_;
-    unsigned factor_epoch_ = 0;
 
     using F_t::lchild_;
     using F_t::rchild_;

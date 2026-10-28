@@ -418,8 +418,6 @@ namespace strumpack {
       d_rhs_batch, d_bupd_batch;
     // Counters for STRUM_LAUNCH2_LOG / STRUM_LAUNCH2_VERIFY.
     std::size_t n_solves = 0, n_meta_uploads = 0, n_mem_uploads = 0;
-    // F-GRAPH: the pivot permutations were derived from the factorization with this epoch
-    unsigned perm_epoch = 0;
 #if defined(STRUMPACK_USE_CUDA)
     GraphExecHolder graph;        // the whole solve (H2D of the staged rhs .. D2H of the solution)
     const void* gkey[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};   // pointers the captured graph bakes in
@@ -612,7 +610,7 @@ namespace strumpack {
     gpu::HostMemory<char> meta_hmem;     // host mirror (gpu::assemble reads the host AssembleData)
     std::vector<char*> level_factors, level_work;
     std::vector<gpu::AssembleData<scalar_t>*> h_asmbl, d_asmbl;
-    gpu::DeviceMemory<scalar_t> d_vals;  // A.val() on the device, refreshed every factorization
+    gpu::DeviceMemory<scalar_t> d_vals;  // A.val() on the device, refreshed every factorization (host-copy path only)
     gpu::DeviceMemory<int> d_src;        // gather map, all levels concatenated
     gpu::DeviceMemory<unsigned> d_dst;
     std::vector<std::size_t> map_off;    // lvls+1 offsets into d_src/d_dst
@@ -632,6 +630,7 @@ namespace strumpack {
 #if defined(STRUMPACK_USE_CUDA)
     std::vector<GraphExecHolder> graphs;
 #endif
+    const scalar_t* graph_vals = nullptr;   // value pointer the graphs were captured with
     std::size_t nfact = 0;
   };
 
@@ -663,21 +662,30 @@ namespace strumpack {
       devperm_.reset();
     }
     ReturnCode err_code = ReturnCode::SUCCESS;
-    auto& C = *factor_cache_;
-    const int gmode = graph_mode();           // 0 off, 1 per-level graphs, 2 one graph for all levels
-    const bool gsolve = graph_solve_on();
-    const bool persistent = gmode != 0 || gsolve;
-    if (persistent) {
-      // F-GRAPH: the solve cache survives a same-structure refactorization (its device meta-data and the factor
-      // pointers stay valid, the solve graph with them); only the pivot permutations are re-derived (perm_epoch).
-      if (!C.stream) {
-        C.stream.reset(new gpu::Stream());
-        C.handle.reset(new gpu::Handle(*C.stream));
-      }
-      factor_epoch_++;
+    static const bool pack_verbose = std::getenv("STRUM_DEVUPDATE_VERBOSE") && std::atoi(std::getenv("STRUM_DEVUPDATE_VERBOSE")) != 0;
+    const auto t_f0 = std::chrono::steady_clock::now();
+    static const bool keep_solve_cache = !(std::getenv("STRUM_SOLVE_CACHE_KEEP") &&
+                                           std::atoi(std::getenv("STRUM_SOLVE_CACHE_KEEP")) == 0);
+    if (keep_solve_cache && solve_cache_) {
+      // S-CACHE-KEEP (magma-hpc F track): same structure and the same persistent factor memory, so the solve
+      // workspace, its meta-data and the device permutation stay valid; only the per-front pivot permutations
+      // are rebuilt at the next solve. This also removes the cudaFree/cudaFreeHost here, whose implicit device
+      // synchronization would wait for the asynchronous value upload of F-DEVUPDATE. (F-GRAPH's solve graph
+      // bakes the cache's device pointers in, so it survives with the cache.)
+      solve_cache_->perm_ready = false;
     } else {
       solve_cache_.reset(); // new factors: rebuild the solve workspace
       devperm_.reset();     // S-HOST: and the device permutation
+    }
+    const auto t_f1 = std::chrono::steady_clock::now();
+    auto& C = *factor_cache_;
+    const int gmode = graph_mode();           // 0 off, 1 per-level graphs, 2 one graph for all levels
+    const bool gsolve = graph_solve_on();
+    // F-GRAPH: persistent stream + handle in graph mode (the graphs are replayed on the same stream; the
+    // per-factorization cuBLAS/cuSOLVER/MAGMA handle creation and its allocations go away)
+    if ((gmode != 0 || gsolve) && !C.stream) {
+      C.stream.reset(new gpu::Stream());
+      C.handle.reset(new gpu::Handle(*C.stream));
     }
     std::unique_ptr<gpu::Stream> tmp_stream;
     std::unique_ptr<gpu::Handle> tmp_handle;
@@ -690,7 +698,31 @@ namespace strumpack {
     // gs != nullptr: every device operation of a level is issued on comp_stream (capturable); otherwise the
     // original mix of legacy-default-stream kernels (memset/gather/assemble) and MAGMA on comp_stream is kept.
     gpu::Stream* gs = gmode ? &comp_stream : nullptr;
-    {
+    if (pack_verbose) {   // item-5 audit: host time before the values are touched
+      const auto t_f2 = std::chrono::steady_clock::now();
+      std::cout << "# F-PACK factor_start solve_cache_reset_ms "
+                << std::chrono::duration<double,std::milli>(t_f1 - t_f0).count()
+                << " stream_handle_create_ms " << std::chrono::duration<double,std::milli>(t_f2 - t_f1).count() << std::endl;
+    }
+    // F-DEVUPDATE: when the value update ran on the device, the permuted values are already there
+    // (the source waits for its upload and verifies it); nothing is copied at the start of the factorization.
+    // F-GRAPH: the capture stream waits for the upload instead of the host; the verification is completed
+    // after the graphs are launched (a repair then re-launches them).
+    const scalar_t* vals = nullptr;
+    DeviceValueSource<scalar_t>* dsrc = A.device_value_source();
+    unsigned long long dgen = 0;
+    if (dsrc) vals = gs ? dsrc->device_values_on_stream(C.nnz, &dgen, gpu::get_cuda_stream(*gs))
+                        : dsrc->device_values(C.nnz, &dgen);
+    if (vals) {
+      C.d_vals.release();   // the host-copy buffers are not needed while the device source is current
+      C.h_vals.release();
+      if (opts.verbose())
+        std::cout << "# F-DEVUPDATE: CSR values taken from the device (generation " << dgen
+                  << "), no host copy" << std::endl;
+    } else {
+      dsrc = nullptr;
+      if (C.d_vals.size() < C.nnz) C.d_vals = gpu::DeviceMemory<scalar_t>(C.nnz);
+      vals = C.d_vals;
       static const bool pin = !(std::getenv("STRUM_PIN_VALUES") &&
                                 std::atoi(std::getenv("STRUM_PIN_VALUES")) == 0);
       if (pin) {
@@ -728,7 +760,7 @@ namespace strumpack {
           gpu::memset_async<scalar_t>(C.level_factors[l], 0, L.factor_size, *gs);
           gpu::gather_front_elements<scalar_t>
             (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
-             C.d_dst + C.map_off[l], C.d_vals, fbase, *gs);
+             C.d_dst + C.map_off[l], vals, fbase, *gs);
           gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l], *gs);
           graph_trace("level:assemble", *gs);
         } else {
@@ -737,7 +769,7 @@ namespace strumpack {
           // default stream: gather of this level's sparse entries, then extend-add
           gpu::gather_front_elements<scalar_t>
             (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
-             C.d_dst + C.map_off[l], C.d_vals, fbase);
+             C.d_dst + C.map_off[l], vals, fbase);
           gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l]);
         }
 
@@ -824,6 +856,12 @@ namespace strumpack {
       STRUMPACK_FLOPS(small_flops);
     };
 #if defined(STRUMPACK_USE_CUDA)
+    // the graphs bake the value pointer in: a switch between the device source and the host copy (or a
+    // reallocated source buffer) invalidates them
+    if (gmode != 0 && vals != C.graph_vals) { C.graphs.clear(); C.graph_vals = vals; }
+#endif
+    auto run_all = [&]() {
+#if defined(STRUMPACK_USE_CUDA)
     if (gmode == 2) {
       // one graph for the whole factorization
       if (C.graphs.size() < 1) C.graphs.resize(1);
@@ -871,11 +909,24 @@ namespace strumpack {
       run_level(l);
       count_flops(l);
     }
+    };
+    run_all();
     C.nfact++;
-    if (persistent) {
-      if (!factor_done_) factor_done_.reset(new gpu::Event());
-      factor_done_->record(comp_stream);
+    if (dsrc && gs && !dsrc->verify_pending_values()) {
+      // the deferred verification repaired the device values: the graphs above read wrong ones, replay
+      std::cerr << "# F-GRAPH: device values were repaired after the launch, re-issuing the factorization" << std::endl;
+      run_all();
     }
+    {
+      // the solve's (blocking) stream and the F-DEVUPDATE write-back must follow the factorization work issued
+      // on comp_stream: an event wait on the legacy default stream is a barrier for every blocking stream
+      cudaEvent_t ev;
+      gpu_check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+      gpu_check(cudaEventRecord(ev, gpu::get_cuda_stream(comp_stream)));
+      gpu_check(cudaStreamWaitEvent(0, ev, 0));
+      gpu_check(cudaEventDestroy(ev));
+    }
+    if (dsrc) dsrc->factor_enqueued();   // F-DEVUPDATE: host write-back now, overlapping the kernels above
     if (gmode) {
       // F-GRAPH: with 15 graph launches instead of ~20k kernel launches the host no longer runs at the GPU's
       // pace (launch-queue backpressure made the eager path return with the GPU nearly done): wait here so that
@@ -884,6 +935,16 @@ namespace strumpack {
       static const bool nosync = graph_env_int("STRUM_GRAPH_NOSYNC", 0) != 0;
       if (!nosync) comp_stream.synchronize();
     }
+    {
+      // the solve's (blocking) stream and the F-DEVUPDATE write-back must follow the factorization work issued
+      // on comp_stream: an event wait on the legacy default stream is a barrier for every blocking stream
+      cudaEvent_t ev;
+      gpu_check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+      gpu_check(cudaEventRecord(ev, gpu::get_cuda_stream(comp_stream)));
+      gpu_check(cudaStreamWaitEvent(0, ev, 0));
+      gpu_check(cudaEventDestroy(ev));
+    }
+    if (dsrc) dsrc->factor_enqueued();   // F-DEVUPDATE: host write-back now, overlapping the kernels above
     return err_code;
   }
 
@@ -914,7 +975,7 @@ namespace strumpack {
     dev_factors_.reset(new gpu::DeviceMemory<char>(C.total_factor_dmem));
     C.meta_dmem = gpu::DeviceMemory<char>(meta_bytes);
     C.meta_hmem = gpu::HostMemory<char>(meta_bytes);
-    C.d_vals = gpu::DeviceMemory<scalar_t>(C.nnz);
+    // C.d_vals (A.val() on the device) is allocated on first use: not needed when the values come from the device
     C.level_factors.assign(lvls, nullptr); C.level_work.assign(lvls, nullptr);
     C.h_asmbl.assign(lvls, nullptr); C.d_asmbl.assign(lvls, nullptr);
 #if defined(STRUMPACK_USE_CUDA)
@@ -1142,12 +1203,6 @@ namespace strumpack {
                   << " elems " << L.elems11.back() + L.elems12.back() + L.elems21.back()
                   << " sum_d1d2 " << sum_d1d2 << " sum_d1sq " << sum_d1sq << std::endl;
       }
-    }
-    if (graph_mode() != 0 || graph_solve_on()) {
-      // F-GRAPH: the solve stream waits on this instead of relying on legacy-default-stream ordering
-      factor_done_.reset(new gpu::Event());
-      factor_done_->record(comp_stream);
-      factor_epoch_++;
     }
     return err_code;
   }
@@ -1558,6 +1613,8 @@ namespace strumpack {
     auto& C = *solve_cache_;
     // first solve with this cache: build level info and metadata
     const bool fresh = C.ldata.empty();
+    static const bool pack_verbose = std::getenv("STRUM_DEVUPDATE_VERBOSE") && std::atoi(std::getenv("STRUM_DEVUPDATE_VERBOSE")) != 0;
+    const auto t_s0 = std::chrono::steady_clock::now();
     auto& handle = C.handle;
     const int lvls = this->levels();
     auto& ldata = C.ldata;
@@ -1701,14 +1758,17 @@ namespace strumpack {
         ldata[l].set_batch_data(C.d_meta.template as<char>() + meta_off[l]);
         C.n_meta_uploads++;
       }
+      if (pack_verbose)
+        std::cout << "# F-PACK solve_cache_build_ms "
+                  << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_s0).count()
+                  << " (level info + meta-data + uploads; once per structure with S-CACHE-KEEP)" << std::endl;
     }
-    // F-GRAPH: the factorization no longer ends on the legacy default stream; order the solve stream after it
-    if (factor_done_) factor_done_->wait(C.comp_stream);
-    // S-LASWP: build the per-front permutations from the pivots (once per factorization / cache)
+    // S-LASWP: build the per-front permutations from the pivots (once per factorization: the factorization
+    // clears perm_ready; S-CACHE-KEEP keeps the rest of this cache)
     static const bool solve_perm = !(std::getenv("STRUM_SOLVE_PERM") && std::atoi(std::getenv("STRUM_SOLVE_PERM")) == 0);
-    if (fresh) {
-      C.perm_ready = false;
-      if (solve_perm) {
+    if (solve_perm && !C.perm_ready) {
+      const auto t_p0 = std::chrono::steady_clock::now();
+      if (!C.d_perm.size()) {
         std::size_t tot = 0;
         for (int l=0; l<lvls; l++) tot += ldata[l].piv_size;
         C.d_perm = gpu::DeviceMemory<int>(tot + 1);
@@ -1724,15 +1784,14 @@ namespace strumpack {
         }
         gpu::copy_host_to_device<int*>(C.d_perm_ptrs, hp.data(), Ntotal + 1);
       }
-    }
-    if (solve_perm && (fresh || C.perm_epoch != factor_epoch_)) {
-      // F-GRAPH: the solve cache survives refactorizations, the pivots do not: re-derive the permutations
       for (int l=lvls-1; l>=0; l--) {
         auto& L = ldata[l];
         if (L.Nsmall) gpu::ipiv_to_perm_vbatched(handle, L.dev_ipiv_batch, L.dev_d1_batch, C.perm_batch[l], L.Nsmall);
       }
       C.perm_ready = true;
-      C.perm_epoch = factor_epoch_;
+      if (pack_verbose)
+        std::cout << "# F-PACK solve_perm_rebuild_ms "
+                  << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_p0).count() << std::endl;
     }
     C.n_solves++;
     // copy rhs, from pageable memory (input)

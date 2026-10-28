@@ -42,6 +42,7 @@
 #include "misc/Triplet.hpp"
 #include "dense/DenseMatrix.hpp"
 #include "StrumpackOptions.hpp"
+#include "DeviceValueSource.hpp"
 
 namespace strumpack {
 
@@ -203,6 +204,14 @@ namespace strumpack {
      * \see ptr, ind
      */
     const scalar_t* val() const { return val_.data(); }
+
+    /**
+     * F-DEVUPDATE: optional provider of this matrix' values on the
+     * GPU (see DeviceValueSource.hpp). Set by the solver after a
+     * device-side value update; not copied with the matrix.
+     */
+    DeviceValueSource<scalar_t>* device_value_source() const { return dev_src_.p; }
+    void set_device_value_source(DeviceValueSource<scalar_t>* s) { dev_src_.p = s; }
 
     /**
      * Return a pointer to the (row/column) pointer. For a compressed
@@ -464,6 +473,12 @@ namespace strumpack {
     std::vector<integer_t> ptr_, ind_;
     std::vector<scalar_t> val_;
     bool symm_sparse_;
+    struct DevSrcRef {   // F-DEVUPDATE: the device value source is tied to one matrix object, never copied
+      DeviceValueSource<scalar_t>* p = nullptr;
+      DevSrcRef() {}
+      DevSrcRef(const DevSrcRef&) {}
+      DevSrcRef& operator=(const DevSrcRef&) { p = nullptr; return *this; }
+    } dev_src_;
 
     enum MMsym {GENERAL, SYMMETRIC, SKEWSYMMETRIC, HERMITIAN};
 
