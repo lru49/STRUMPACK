@@ -61,6 +61,7 @@ namespace strumpack {
     class Stream {
     public:
       Stream();
+      explicit Stream(bool non_blocking);   // S-INVDIAG: cudaStreamNonBlocking (no implicit sync with the legacy default stream)
       ~Stream();
       void synchronize();
 
@@ -471,6 +472,15 @@ namespace strumpack {
     // assume inc = 1
     // S-LASWP (CUDA backend only): pivot sequence -> permutation once, parallel gather per solve
     void ipiv_to_perm_vbatched(Handle& handle, int** dipiv, int* npiv, int** dperm, unsigned int batchCount);
+    // S-INVDIAG fused recurrence step: for front i (grid.x) out_i[0:m_i) = inv_i * (yin_i[0:m_i) - A_i[0:m_i, 0:n_i) x_i[0:n_i))
+    // with the dense product split over grid.y = S column chunks of `chunk` columns (partial sums in `partial`, the last
+    // CTA of a front, found with `counter`, reduces and applies the NB x NB inverse, ld NB). Real types, NB 128 / 256
+    // only: returns false otherwise (caller uses the two vbatched gemvs).
+    // m_next / n_next / A_next (or null): the next step's block row, prefetched into L2 by this step's CTAs.
+    template<typename scalar_t> bool
+    invdiag_step(Handle& handle, int N, int S, int NB, int chunk, const int* m, const int* n,
+                 scalar_t** A, const int* lda, scalar_t** x, scalar_t** yin, scalar_t** inv, scalar_t** out,
+                 scalar_t* partial, int* counter, const int* m_next, const int* n_next, scalar_t** A_next);
     template<typename scalar_t> bool
     permute_rows_fwd_vbatched(Handle& handle, int* dn, scalar_t** dA, int* lddA, int** dperm,
                               int* npiv, int max_npiv, unsigned int batchCount);

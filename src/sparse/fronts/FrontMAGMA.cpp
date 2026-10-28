@@ -32,6 +32,7 @@
 #include <cuda_runtime_api.h>
 #endif
 #include <cstring>
+#include <nvtx3/nvToolsExt.h>   // S-INVDIAG: header-only NVTX ranges for the solve trace (STRUM_SOLVE_NVTX=1)
 #include <limits>
 #include <type_traits>
 #include <fstream>
@@ -326,6 +327,8 @@ namespace strumpack {
     gpu::DeviceMemory<int> inv_ints;
     gpu::DeviceMemory<scalar_t*> inv_ptrs;
     gpu::DeviceMemory<scalar_t> d_scr;
+    gpu::DeviceMemory<scalar_t> d_partial;   // fused step: N x 32 x NB partial sums
+    gpu::DeviceMemory<int> d_counter;        // fused step: per-front arrival counters (self-resetting)
   };
 
   // S-INVDIAG (magma-hpc, 2026-10-27): the top-of-tree fronts (d1 of several hundred to a few thousand rows) solve
@@ -351,6 +354,12 @@ namespace strumpack {
     }
     inline bool use_U() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_U", 1) != 0; return v; }
     inline int verbose() { static const int v = env_int("STRUM_INVDIAG_VERBOSE", 0); return v; }
+    inline bool own_stream() { static const bool v = env_int("STRUM_INVDIAG_STREAM", 1) != 0; return v; }   // v2: inversion on a second stream
+    inline bool fused() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_FUSED", 1) != 0; return v; }      // v2: one kernel per step
+    inline int chunk() { static const int v = std::max(32, env_int("STRUM_SOLVE_INVDIAG_CHUNK", 128)); return v; }
+    inline bool nvtx() { static const bool v = env_int("STRUM_SOLVE_NVTX", 0) != 0; return v; }
+    inline bool prefetch() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_PREFETCH", 1) != 0; return v; }
+    struct Range { bool on; Range(const char* s) : on(nvtx()) { if (on) nvtxRangePushA(s); } ~Range() { if (on) nvtxRangePop(); } };
   }
 
   // S-HOST: device copy of the sparse reordering permutation, cached across solves. Rebuilt after every
@@ -570,6 +579,16 @@ namespace strumpack {
     };
     std::vector<InvLevel> inv;
     gpu::DeviceMemory<scalar_t> inv_scratch;   // intermediate layouts + gemm temporaries (max over levels)
+    // v2: the inversion of a level runs on its own (non-blocking) stream right after the level's LU, overlapping the
+    // level's trsm / Schur gemm on the compute stream; inv_ready[l] = LU done (compute -> inv stream), inv_done[l] =
+    // inverses ready (inv stream -> the solve's stream and the next factorization's compute stream).
+    gpu::Stream inv_stream;
+    gpu::Handle inv_handle;
+    std::vector<std::unique_ptr<gpu::Event>> inv_ready, inv_done;
+    std::vector<cudaEvent_t> inv_t0, inv_t1;   // verbose timing per level (on the inversion stream)
+    std::vector<float> inv_level_ms;
+    FactorCache() : inv_stream(true), inv_handle(inv_stream) {}
+    ~FactorCache() { for (auto e : inv_t0) if (e) cudaEventDestroy(e); for (auto e : inv_t1) if (e) cudaEventDestroy(e); }
     double inv_ms = 0.;                         // inversion time of the last factorization (verbose)
     double inv_resid = 0.;                      // max ||I - inv * block|| of the last factorization (verbose >= 2)
     std::size_t inv_bytes = 0;
@@ -628,6 +647,9 @@ namespace strumpack {
     }
     scalar_t* fbase = dev_factors_->template as<scalar_t>();
     C.inv_ms = 0.; C.inv_resid = 0.;
+    // S-INVDIAG v2: the previous factorization's inversions must be done before F11 is overwritten (the memsets /
+    // gathers below run on the legacy default stream, which is ordered after comp_stream)
+    for (int l=0; l<int(C.inv.size()); l++) if (C.inv[l].on && C.inv_done[l]) C.inv_done[l]->wait(comp_stream);
     for (int l=C.lvls-1; l>=0; l--) {
       auto& L = C.ldata[l];
       try {
@@ -678,7 +700,17 @@ namespace strumpack {
               (L.f[i]->F11_.rows(), L.f[i]->F11_.data(),
                opts.pivot_threshold());
         }
-        if (l < int(C.inv.size()) && C.inv[l].on) invdiag_build(l, handle);   // S-INVDIAG: F11 is final here
+        if (l < int(C.inv.size()) && C.inv[l].on) {   // S-INVDIAG: F11 is final here
+          if (invdiag::own_stream()) {
+            C.inv_ready[l]->record(comp_stream);
+            C.inv_ready[l]->wait(C.inv_stream);
+            invdiag_build(l, C.inv_handle);
+            C.inv_done[l]->record(C.inv_stream);
+          } else {
+            invdiag_build(l, handle);
+            C.inv_done[l]->record(comp_stream);
+          }
+        }
         gpu::laswp_fwd_vbatched
           (handle, d2, L.max_d2_small, F12, ld1, L.dev_ipiv_batch,
            d1, Nsmall);
@@ -725,7 +757,16 @@ namespace strumpack {
       STRUMPACK_FLOPS(small_flops);
     }
     if (invdiag::verbose() && C.inv_bytes) {
-      std::cout << "# INVDIAG factorization inversion_ms " << C.inv_ms << " inv_MB " << C.inv_bytes / 1e6;
+      std::cout << "# INVDIAG factorization";
+      for (int l=0; l<C.lvls; l++) {
+        if (!C.inv[l].on) continue;
+        cudaEventSynchronize(C.inv_t1[l]);
+        float ms = 0.f; cudaEventElapsedTime(&ms, C.inv_t0[l], C.inv_t1[l]);
+        C.inv_ms += ms;
+        std::cout << " l" << l << "_ms " << ms;
+      }
+      std::cout << " inversion_ms " << C.inv_ms << " inv_MB " << C.inv_bytes / 1e6
+                << " stream " << (invdiag::own_stream() ? "own" : "compute");
       if (invdiag::verbose() >= 2) std::cout << " max_resid " << C.inv_resid;
       std::cout << std::endl;
     }
@@ -895,9 +936,13 @@ namespace strumpack {
       for (auto f : L.f) V.nblk_max = std::max<int>(V.nblk_max, blocks(f->dim_sep(), NB));
     }
     if (scratch_max) C.inv_scratch = gpu::DeviceMemory<scalar_t>(scratch_max);
+    C.inv_ready.clear(); C.inv_done.clear(); C.inv_ready.resize(lvls); C.inv_done.resize(lvls);
+    C.inv_t0.assign(lvls, nullptr); C.inv_t1.assign(lvls, nullptr); C.inv_level_ms.assign(lvls, 0.f);
     for (int l=0; l<lvls; l++) {
       auto& V = C.inv[l];
       if (!V.on) continue;
+      C.inv_ready[l].reset(new gpu::Event()); C.inv_done[l].reset(new gpu::Event());
+      cudaEventCreate(&C.inv_t0[l]); cudaEventCreate(&C.inv_t1[l]);
       auto& L = ldata[l];
       const std::size_t N = L.f.size();
       std::vector<int> ints;
@@ -1008,13 +1053,12 @@ namespace strumpack {
     auto& L = C.ldata[l];
     const magma_int_t N = L.Nsmall;
     const int verbose = invdiag::verbose();
-    cudaEvent_t e0 = nullptr, e1 = nullptr;
     cudaStream_t st = magma_queue_get_cuda_stream(gpu::get_magma_queue(handle));
-    if (verbose) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, st); }
-    gpu::memset<scalar_t>(V.d_inv, 0, 2 * V.side_elems);
+    if (verbose) cudaEventRecord(C.inv_t0[l], st);
+    cudaMemsetAsync(V.d_inv.template as<scalar_t>(), 0, 2 * V.side_elems * sizeof(scalar_t), st);
     // the intermediate layouts in the scratch must be zero too: the lacpy of a composed s-block copies its whole
     // s x s square, including the quadrant that round never writes (NB = 512 read the previous level's data there)
-    if (V.scratch_elems) gpu::memset<scalar_t>(C.inv_scratch, 0, V.scratch_elems);
+    if (V.scratch_elems) cudaMemsetAsync(C.inv_scratch.template as<scalar_t>(), 0, V.scratch_elems * sizeof(scalar_t), st);
     for (int side=0; side<2; side++) {
       // MAGMA's trtri_diag_vbatched returns wrong blocks (checked standalone, stock 2.10.0 too): one nonbatched
       // call per front (~10 launches each, once per factorization)
@@ -1045,12 +1089,9 @@ namespace strumpack {
         }
       }
     }
-    if (verbose) {
-      cudaEventRecord(e1, st); cudaEventSynchronize(e1);
-      float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1); C.inv_ms += ms;
-      cudaEventDestroy(e0); cudaEventDestroy(e1);
-    }
+    if (verbose) cudaEventRecord(C.inv_t1[l], st);
     if (verbose >= 2) {   // host check: max over blocks of ||I - inv * block||_max
+      cudaStreamSynchronize(st);
       const int NB = V.nb;
       double worst = 0.;
       for (int side=0; side<2; side++)
@@ -1850,6 +1891,17 @@ namespace strumpack {
                       << " U " << (S.U ? "inv" : "trsm") << std::endl;
         }
         if (!ints.empty()) {
+          std::size_t part_max = 0, nmax_on = 0;
+          for (int l=0; l<lvls; l++) if (C.inv[l].on) {
+            factor_cache_->inv_done[l]->wait(C.comp_stream);   // inverses of this factorization ready
+            part_max = std::max(part_max, ldata[l].f.size() * 32 * std::size_t(C.inv[l].nb));
+            nmax_on = std::max(nmax_on, ldata[l].f.size());
+          }
+          if (invdiag::fused()) {
+            C.d_partial = gpu::DeviceMemory<scalar_t>(part_max);
+            C.d_counter = gpu::DeviceMemory<int>(nmax_on);
+            gpu::memset<int>(C.d_counter, 0, nmax_on);
+          }
           C.inv_ints = gpu::DeviceMemory<int>(ints.size());
           C.inv_ptrs = gpu::DeviceMemory<scalar_t*>(ptrs.size());
           gpu::copy_host_to_device<int>(C.inv_ints, ints.data(), ints.size());
@@ -1902,19 +1954,25 @@ namespace strumpack {
     // forward solve
     for (int l=lvls-1; l>=0; l--) {
       if (solve_sync) gpu::synchronize_default_stream();
+      std::string rname = "fwd l=" + std::to_string(l);
+      invdiag::Range rlev(rname.c_str());
       auto& L = ldata[l];
       std::size_t N = L.f.size(), Nsmall = L.Nsmall;
       // batch meta-data was uploaded once, see above (L.dev_*_batch)
       auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
       auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
       auto F11 = L.dev_F_batch;   auto F21 = F11 + 2*Nsmall;
+      {
+      invdiag::Range rea("ea");
       gpu::memset<scalar_t>
         ((l % 2) ? d_bupd_odd : d_bupd_even, 0, L.total_upd_size*nrhs);
       if (l != lvls-1)
         gpu::extend_add_rhs
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
+      }
       // TODO remove?
       if (solve_sync) gpu::synchronize_default_stream();
+      invdiag::Range* rsub = new invdiag::Range("perm");
       if (!(C.perm_ready && Nsmall &&
             gpu::permute_rows_fwd_vbatched<scalar_t>
             (handle, nrhs_batch+Nmax-Nsmall, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
@@ -1923,15 +1981,31 @@ namespace strumpack {
           (handle, nrhs_batch+Nmax-Nsmall, nrhs,
            d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
            L.dev_ipiv_batch, d1, Nsmall);
+      delete rsub;
       const auto* IV = (nrhs == 1 && !C.inv.empty() && C.inv[l].on) ? &C.inv[l] : nullptr;
       if (IV) {
+        // v2 fused path: one kernel per step (real types, NB 128/256), otherwise the two vbatched gemvs per step
+        const bool fused = invdiag::fused() && (IV->nb == 128 || IV->nb == 256);
+        const int chunk0 = invdiag::chunk();
+        const bool pf = invdiag::prefetch();
+        auto fused_step = [&](const int* m, const int* n, int maxn, scalar_t** A, scalar_t** x, scalar_t** yin,
+                              scalar_t** inv, scalar_t** out, const int* mn, const int* nn, scalar_t** An) {
+          const int chunk = std::max(chunk0, (maxn + 31) / 32);
+          const int S = maxn > 0 ? (maxn + chunk - 1) / chunk : 1;
+          return gpu::invdiag_step<scalar_t>(handle, N, S, IV->nb, chunk, m, n, A, ld1, x, yin, inv, out,
+                                             C.d_partial, C.d_counter, pf ? mn : nullptr, nn, An);
+        };
         // S-INVDIAG: block recurrence with the explicit inverses of the diagonal blocks (all fronts of the level
         // in one vbatched gemv per step). L11: x_k = Linv_kk (b_k - L_{k,0:k} x_{0:k}), the b blocks are updated
         // in place in the rhs and x goes to the scratch vector; U11: x_k = Uinv_kk (y_k - U_{k,k+1:} x_{k+1:}),
         // y in the scratch updated in place, x back into the rhs.
         const int NB = IV->nb, K = IV->nblk;
         auto inc = inc_batch+Nmax-Nsmall;
+        invdiag::Range* rl = new invdiag::Range(fused ? "L11 fused" : "L11 vbatched");
         for (int k=0; k<K; k++) {
+          if (fused && fused_step(IV->mL+k*N, IV->nLu+k*N, IV->maxLu[k], IV->AL+k*N, IV->scr, IV->rhs+k*N,
+                                  IV->Li+k*N, IV->scr+k*N,
+                                  k+1 < K ? IV->mL+(k+1)*N : nullptr, IV->nLu+std::min(k+1,K-1)*N, IV->AL+std::min(k+1,K-1)*N)) continue;
           if (k > 0 && IV->maxLu[k] > 0)
             gpu::magma::gemv_vbatched_max_nocheck
               (MagmaNoTrans, IV->mL+k*N, IV->nLu+k*N, scalar_t(-1.), IV->AL+k*N, ld1, IV->scr, inc,
@@ -1940,12 +2014,17 @@ namespace strumpack {
             (MagmaNoTrans, IV->mL+k*N, IV->mL+k*N, scalar_t(1.), IV->Li+k*N, IV->ldnb, IV->rhs+k*N, inc,
              scalar_t(0.), IV->scr+k*N, inc, N, NB, NB, handle);
         }
+        delete rl;
         if (IV->U) {
+          invdiag::Range ru(fused ? "U11 fused" : "U11 vbatched");
           for (int k=K-1; k>=0; k--) {
             bool upd = k < K-1 && IV->maxUu[k] > 0;
 #if defined(STRUM_PLANT_INVDIAG)
             if (l == 0 && k == 0) upd = false;   // PLANT invdiag-skip-root-u0: the root's first block misses its U update
 #endif
+            if (fused && fused_step(IV->mL+k*N, upd ? IV->nUu+k*N : IV->nLu, upd ? IV->maxUu[k] : 0, IV->AU+k*N,
+                                    IV->rhs+std::min(k+1, K-1)*N, IV->scr+k*N, IV->Ui+k*N, IV->rhs+k*N,
+                                    k > 0 ? IV->mL+(k-1)*N : nullptr, IV->nUu+std::max(k-1,0)*N, IV->AU+std::max(k-1,0)*N)) continue;
             if (upd)
               gpu::magma::gemv_vbatched_max_nocheck
                 (MagmaNoTrans, IV->mL+k*N, IV->nUu+k*N, scalar_t(-1.), IV->AU+k*N, ld1, IV->rhs+(k+1)*N, inc,
@@ -1956,6 +2035,7 @@ namespace strumpack {
           }
         } else {
           // y = L^{-1} b back into the rhs, then the U11 solve on the trsm path
+          invdiag::Range ru("U11 trsm");
           gpu::magma::lacpy_vbatched
             (MagmaFull, L.max_d1_small, 1, d1, nrhs_batch+Nmax-Nsmall, (const scalar_t* const*)IV->scr, ld1,
              IV->rhs, ld1, N, handle);
@@ -1966,6 +2046,7 @@ namespace strumpack {
              Nsmall, handle);
         }
       } else {
+      invdiag::Range rt("L11+U11 trsm");
       gpu::magma::trsm_vbatched_max_nocheck
         (MagmaLeft, MagmaLower, MagmaNoTrans, MagmaUnit,
          L.max_d1_small, nrhs, d1, nrhs_batch+Nmax-Nsmall, scalar_t(1.),
@@ -1982,6 +2063,7 @@ namespace strumpack {
         gpu::getrs(handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_, fb, getrs_err);
       }
       if (l == 0) break;
+      invdiag::Range rg("F21");
       if (nrhs == 1)
         gpu::magma::gemv_vbatched_max_nocheck
           (MagmaNoTrans, d2, d1, scalar_t(-1.),
@@ -2010,6 +2092,8 @@ namespace strumpack {
 
     // backward solve
     for (int l=0; l<lvls; l++) {
+      std::string rname = "bwd l=" + std::to_string(l);
+      invdiag::Range rlev(rname.c_str());
       auto& L = ldata[l];
       std::size_t N = L.f.size(), Nsmall = L.Nsmall;
       auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
@@ -2017,6 +2101,7 @@ namespace strumpack {
       auto F12 = L.dev_F_batch + Nsmall;
       if (solve_sync) gpu::synchronize_default_stream();
       if (l != 0) {
+        invdiag::Range rg("F12");
         if (nrhs == 1)
           gpu::magma::gemv_vbatched_max_nocheck
             (MagmaNoTrans, d1, d2, scalar_t(-1.), F12, ld1,
@@ -2041,9 +2126,11 @@ namespace strumpack {
         }
       }
       if (solve_sync) gpu::synchronize_default_stream();
-      if (l != lvls-1)
+      if (l != lvls-1) {
+        invdiag::Range rx("extract");
         gpu::extract_rhs
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
+      }
     }
     if (dp) {
       // S-HOST: undo the reordering on the device, x(i,:) = y(perm[i],:), then download (replaces transform_x)
