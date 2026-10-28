@@ -151,47 +151,28 @@ namespace strumpack {
     template bool permute_rows_fwd_vbatched(Handle&, int*, std::complex<float>**, int*, int**, int*, int, unsigned int);
     template bool permute_rows_fwd_vbatched(Handle&, int*, std::complex<double>**, int*, int**, int*, int, unsigned int);
 
-    // S-INVDIAG (magma-hpc, 2026-10-27) fused block-recurrence step, see GPUWrapper.hpp. Threads: 4 column lanes x NB
-    // rows; lane L reads columns j = L (mod 4) of its chunk so that a warp reads 32 consecutive rows of one column
-    // (coalesced); the 4 lane partials are reduced through shared memory. S > 1: each CTA stores its NB partial sums,
-    // fences, bumps the front's counter; the last CTA sums the chunks (L2 loads), forms t = yin - sum and applies the
-    // inverse (again 4 lanes over the columns of the NB x NB block), then resets the counter for the next step.
+    // S-INVDIAG (magma-hpc, 2026-10-27) block-recurrence step, see GPUWrapper.hpp. v2b: two atomics-free kernels per
+    // step, both wide enough to pull bandwidth (the 256-row shapes defeat MAGMA's gemv and a single CTA: ~30-46 us
+    // per step at the root, nsys).  U: grid (fronts, S column chunks), 4 column lanes x NB rows, lane L reads
+    // columns j = L (mod 4) of its chunk (a warp reads 32 consecutive rows of one column), partial sums to global.
+    // R: grid (fronts, NB/16 row groups), each CTA forms t = yin - sum of the S partials (L2), then its 16 rows of
+    // out = inv * t over the triangular half only (the other half is zero: skipping it is exact), and prefetches
+    // (L2) its share of the NEXT step's block row, which does not depend on this step's result (user suggestion).
     template<typename T, int NB> __global__ void __launch_bounds__(4*NB)
-    invdiag_step_kernel(const int* m, const int* n, T* const* A, const int* lda, T* const* x, T* const* yin,
-                        T* const* inv, T** out, T* partial, int* counter, int chunk, int smax,
-                        const int* m_next, const int* n_next, T* const* A_next) {
+    invdiag_upd_kernel(const int* m, const int* n, T* const* A, const int* lda, T* const* x, T* partial, int chunk, int smax) {
       __shared__ T red[4][NB];
-      __shared__ T t[NB];
-      __shared__ int s_last;
       const int i = blockIdx.x, s = blockIdx.y;
-      const int r = m[i];
-      if (r <= 0) return;
-      const int nn = n[i];
-      const int S = nn > 0 ? (nn + chunk - 1) / chunk : 1;
-      if (s >= S) return;
+      const int r = m[i], nn = n[i];
+      if (r <= 0 || nn <= 0) return;
+      const int c0 = s * chunk;
+      if (c0 >= nn) return;
+      const int c1 = min(nn, c0 + chunk);
       const int tid = threadIdx.x, row = tid % NB, lane = tid / NB;
-      if (m_next) {
-        // prefetch (into L2) the NEXT step's block row, which does not depend on this step's result: the S CTAs of
-        // the front share its columns; one 128-byte line per thread per iteration (user suggestion, v2 brief)
-        const int rn = m_next[i], cn = n_next[i];
-        if (rn > 0 && cn > 0) {
-          const char* An = reinterpret_cast<const char*>(A_next[i]);
-          const std::size_t ldb = std::size_t(lda[i]) * sizeof(T);
-          const int lines = (rn * int(sizeof(T)) + 127) / 128 + 1;
-          const int cs = (cn + S - 1) / S, cb = s * cs, ce = min(cn, cb + cs);
-          for (int e = tid; e < (ce - cb) * lines; e += 4*NB) {
-            const int j = cb + e / lines, ln = e % lines;
-            const char* p = An + std::size_t(j) * ldb + std::size_t(ln) * 128;
-            asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
-          }
-        }
-      }
       T acc = T(0);
-      if (row < r && nn > 0) {
+      if (row < r) {
         const T* Ai = A[i] + row;
         const std::size_t ld = lda[i];
         const T* xi = x[i];
-        const int c0 = s * chunk, c1 = min(nn, c0 + chunk);
         int j = c0 + lane;
         for (; j + 12 < c1; j += 16) {
           const T a0 = Ai[j*ld], a1 = Ai[(j+4)*ld], a2 = Ai[(j+8)*ld], a3 = Ai[(j+12)*ld];
@@ -201,68 +182,102 @@ namespace strumpack {
       }
       red[lane][row] = acc;
       __syncthreads();
-      if (S == 1) {
-        if (lane == 0 && row < r) t[row] = yin[i][row] - (red[0][row] + red[1][row] + red[2][row] + red[3][row]);
-      } else {
-        if (lane == 0) partial[(std::size_t(i)*smax + s)*NB + row] = red[0][row] + red[1][row] + red[2][row] + red[3][row];
-        __threadfence();
-        __syncthreads();
-        if (tid == 0) s_last = (atomicAdd(&counter[i], 1) == S - 1);
-        __syncthreads();
-        if (!s_last) return;
-        __threadfence();
-        if (lane == 0) {
-          T p = T(0);
-          for (int q=0; q<S; q++) p += __ldcg(&partial[(std::size_t(i)*smax + q)*NB + row]);
-          if (row < r) t[row] = yin[i][row] - p;
+      if (lane == 0 && row < r) partial[(std::size_t(i)*smax + s)*NB + row] = red[0][row] + red[1][row] + red[2][row] + red[3][row];
+    }
+    template<typename T, int NB, bool LOWER> __global__ void __launch_bounds__(1024)
+    invdiag_apply_kernel(const int* m, const int* n, const int* lda, T* const* yin, T* const* inv, T** out,
+                         const T* partial, int chunk, int smax, const int* m_next, const int* n_next, T* const* A_next) {
+      constexpr int RW = 16, LANES = 1024 / RW;   // rows per CTA, column lanes
+      __shared__ T t[NB];
+      __shared__ T red[LANES][RW + 1];
+      const int i = blockIdx.x, g = blockIdx.y;
+      const int r = m[i];
+      if (r <= 0 || g * RW >= r) return;
+      const int tid = threadIdx.x;
+      const int nn = n[i], S = nn > 0 ? min(smax, (nn + chunk - 1) / chunk) : 0;
+      if (m_next) {   // prefetch the next step's block row: the NB/16 CTAs of the front share its columns
+        const int rn = m_next[i], cn = n_next[i];
+        if (rn > 0 && cn > 0) {
+          const char* An = reinterpret_cast<const char*>(A_next[i]);
+          const std::size_t ldb = std::size_t(lda[i]) * sizeof(T);
+          const int lines = (rn * int(sizeof(T)) + 127) / 128 + 1, G = (r + RW - 1) / RW;
+          const int cs = (cn + G - 1) / G, cb = g * cs, ce = min(cn, cb + cs);
+          for (int e = tid; e < (ce - cb) * lines; e += 1024) {
+            const int j = cb + e / lines, ln = e % lines;
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(An + std::size_t(j) * ldb + std::size_t(ln) * 128));
+          }
         }
-        if (tid == 0) counter[i] = 0;
       }
-      __syncthreads();
-      T acc2 = T(0);
+      // t = yin - sum of partials (4 lanes over the chunks when NB == 256, 8 when NB == 128)
+      {
+        constexpr int TL = 1024 / NB;
+        const int j = tid % NB, l = tid / NB;
+        T p = T(0);
+        if (j < r) for (int q=l; q<S; q+=TL) p += __ldcg(&partial[(std::size_t(i)*smax + q)*NB + j]);
+        __shared__ T tr[TL][NB];
+        tr[l][j] = p;
+        __syncthreads();
+        if (l == 0 && j < r) { T sum = T(0); for (int q=0; q<TL; q++) sum += tr[q][j]; t[j] = yin[i][j] - sum; }
+        __syncthreads();
+      }
+      const int rl = tid % RW, lane = tid / RW, row = g * RW + rl;
+      T acc = T(0);
       if (row < r) {
         const T* Ii = inv[i] + row;
+        // triangular half: L: columns j <= row ; U: columns j >= row
+        const int j0 = LOWER ? 0 : row, j1 = LOWER ? row + 1 : r;
+        int j = j0 + ((lane - (j0 % LANES) + LANES) % LANES);
 #pragma unroll 4
-        for (int j=lane; j<r; j+=4) acc2 += Ii[j*NB] * t[j];
+        for (; j < j1; j += LANES) acc += Ii[j*NB] * t[j];
       }
+      red[lane][rl] = acc;
       __syncthreads();
-      red[lane][row] = acc2;
-      __syncthreads();
-      if (lane == 0 && row < r) out[i][row] = red[0][row] + red[1][row] + red[2][row] + red[3][row];
+      if (tid < RW && row < r) { T sum = T(0); for (int q=0; q<LANES; q++) sum += red[q][tid]; out[i][row] = sum; }
     }
     template<typename T> bool
     invdiag_step_real(Handle& handle, int N, int S, int NB, int chunk, const int* m, const int* n,
                       T** A, const int* lda, T** x, T** yin, T** inv, T** out, T* partial, int* counter,
-                      const int* m_next, const int* n_next, T** A_next) {
+                      const int* m_next, const int* n_next, T** A_next, bool lower) {
       if (N <= 0) return true;
       if (NB != 128 && NB != 256) return false;
+      (void)counter;
       cudaStream_t streamId;
       cublasGetStream(get_cublas_handle(handle), &streamId);
-      dim3 grid(N, std::max(1, S));
-      if (NB == 256)
-        invdiag_step_kernel<T,256><<<grid, 1024, 0, streamId>>>(m, n, A, lda, x, yin, inv, out, partial, counter, chunk, 32, m_next, n_next, A_next);
-      else
-        invdiag_step_kernel<T,128><<<grid, 512, 0, streamId>>>(m, n, A, lda, x, yin, inv, out, partial, counter, chunk, 32, m_next, n_next, A_next);
+      const int smax = 64;
+      if (S > 0) {
+        dim3 gu(N, std::min(S, smax));
+        if (NB == 256) invdiag_upd_kernel<T,256><<<gu, 1024, 0, streamId>>>(m, n, A, lda, x, partial, chunk, smax);
+        else           invdiag_upd_kernel<T,128><<<gu, 512, 0, streamId>>>(m, n, A, lda, x, partial, chunk, smax);
+        gpu_check(cudaPeekAtLastError());
+      }
+      dim3 ga(N, NB / 16);
+      if (NB == 256) {
+        if (lower) invdiag_apply_kernel<T,256,true><<<ga, 1024, 0, streamId>>>(m, n, lda, yin, inv, out, partial, chunk, smax, m_next, n_next, A_next);
+        else       invdiag_apply_kernel<T,256,false><<<ga, 1024, 0, streamId>>>(m, n, lda, yin, inv, out, partial, chunk, smax, m_next, n_next, A_next);
+      } else {
+        if (lower) invdiag_apply_kernel<T,128,true><<<ga, 1024, 0, streamId>>>(m, n, lda, yin, inv, out, partial, chunk, smax, m_next, n_next, A_next);
+        else       invdiag_apply_kernel<T,128,false><<<ga, 1024, 0, streamId>>>(m, n, lda, yin, inv, out, partial, chunk, smax, m_next, n_next, A_next);
+      }
       gpu_check(cudaPeekAtLastError());
       return true;
     }
     template<typename scalar_t> bool
     invdiag_step(Handle&, int, int, int, int, const int*, const int*, scalar_t**, const int*, scalar_t**, scalar_t**,
-                 scalar_t**, scalar_t**, scalar_t*, int*, const int*, const int*, scalar_t**) { return false; }
+                 scalar_t**, scalar_t**, scalar_t*, int*, const int*, const int*, scalar_t**, bool) { return false; }
     template<> bool
     invdiag_step<float>(Handle& h, int N, int S, int NB, int chunk, const int* m, const int* n, float** A, const int* lda,
                         float** x, float** yin, float** inv, float** out, float* partial, int* counter,
-                        const int* mn, const int* nn, float** An) {
-      return invdiag_step_real<float>(h, N, S, NB, chunk, m, n, A, lda, x, yin, inv, out, partial, counter, mn, nn, An);
+                        const int* mn, const int* nn, float** An, bool lower) {
+      return invdiag_step_real<float>(h, N, S, NB, chunk, m, n, A, lda, x, yin, inv, out, partial, counter, mn, nn, An, lower);
     }
     template<> bool
     invdiag_step<double>(Handle& h, int N, int S, int NB, int chunk, const int* m, const int* n, double** A, const int* lda,
                          double** x, double** yin, double** inv, double** out, double* partial, int* counter,
-                         const int* mn, const int* nn, double** An) {
-      return invdiag_step_real<double>(h, N, S, NB, chunk, m, n, A, lda, x, yin, inv, out, partial, counter, mn, nn, An);
+                         const int* mn, const int* nn, double** An, bool lower) {
+      return invdiag_step_real<double>(h, N, S, NB, chunk, m, n, A, lda, x, yin, inv, out, partial, counter, mn, nn, An, lower);
     }
-    template bool invdiag_step(Handle&, int, int, int, int, const int*, const int*, std::complex<float>**, const int*, std::complex<float>**, std::complex<float>**, std::complex<float>**, std::complex<float>**, std::complex<float>*, int*, const int*, const int*, std::complex<float>**);
-    template bool invdiag_step(Handle&, int, int, int, int, const int*, const int*, std::complex<double>**, const int*, std::complex<double>**, std::complex<double>**, std::complex<double>**, std::complex<double>**, std::complex<double>*, int*, const int*, const int*, std::complex<double>**);
+    template bool invdiag_step(Handle&, int, int, int, int, const int*, const int*, std::complex<float>**, const int*, std::complex<float>**, std::complex<float>**, std::complex<float>**, std::complex<float>**, std::complex<float>*, int*, const int*, const int*, std::complex<float>**, bool);
+    template bool invdiag_step(Handle&, int, int, int, int, const int*, const int*, std::complex<double>**, const int*, std::complex<double>**, std::complex<double>**, std::complex<double>**, std::complex<double>**, std::complex<double>*, int*, const int*, const int*, std::complex<double>**, bool);
 
     // S-HOST (magma-hpc, 2026-10-27): the sparse reordering applied to the right-hand side / solution on the device,
     // dst(i,j) = src(perm[i],j) for an n x nrhs column-major block with ld = n (one thread per row). A pure gather:

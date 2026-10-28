@@ -356,9 +356,9 @@ namespace strumpack {
     inline int verbose() { static const int v = env_int("STRUM_INVDIAG_VERBOSE", 0); return v; }
     inline bool own_stream() { static const bool v = env_int("STRUM_INVDIAG_STREAM", 1) != 0; return v; }   // v2: inversion on a second stream
     inline bool fused() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_FUSED", 1) != 0; return v; }      // v2: one kernel per step
-    inline int chunk() { static const int v = std::max(32, env_int("STRUM_SOLVE_INVDIAG_CHUNK", 128)); return v; }
+    inline int chunk() { static const int v = std::max(16, env_int("STRUM_SOLVE_INVDIAG_CHUNK", 64)); return v; }
     inline bool nvtx() { static const bool v = env_int("STRUM_SOLVE_NVTX", 0) != 0; return v; }
-    inline bool prefetch() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_PREFETCH", 1) != 0; return v; }
+    inline bool prefetch() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_PREFETCH", 0) != 0; return v; }   // v2 trace: +0.14 ms with the single-CTA apply; re-measured with v2b
     struct Range { bool on; Range(const char* s) : on(nvtx()) { if (on) nvtxRangePushA(s); } ~Range() { if (on) nvtxRangePop(); } };
   }
 
@@ -1894,7 +1894,7 @@ namespace strumpack {
           std::size_t part_max = 0, nmax_on = 0;
           for (int l=0; l<lvls; l++) if (C.inv[l].on) {
             factor_cache_->inv_done[l]->wait(C.comp_stream);   // inverses of this factorization ready
-            part_max = std::max(part_max, ldata[l].f.size() * 32 * std::size_t(C.inv[l].nb));
+            part_max = std::max(part_max, ldata[l].f.size() * 64 * std::size_t(C.inv[l].nb));
             nmax_on = std::max(nmax_on, ldata[l].f.size());
           }
           if (invdiag::fused()) {
@@ -1989,11 +1989,11 @@ namespace strumpack {
         const int chunk0 = invdiag::chunk();
         const bool pf = invdiag::prefetch();
         auto fused_step = [&](const int* m, const int* n, int maxn, scalar_t** A, scalar_t** x, scalar_t** yin,
-                              scalar_t** inv, scalar_t** out, const int* mn, const int* nn, scalar_t** An) {
-          const int chunk = std::max(chunk0, (maxn + 31) / 32);
-          const int S = maxn > 0 ? (maxn + chunk - 1) / chunk : 1;
+                              scalar_t** inv, scalar_t** out, const int* mn, const int* nn, scalar_t** An, bool lower) {
+          const int chunk = std::max(chunk0, (maxn + 63) / 64);
+          const int S = maxn > 0 ? (maxn + chunk - 1) / chunk : 0;
           return gpu::invdiag_step<scalar_t>(handle, N, S, IV->nb, chunk, m, n, A, ld1, x, yin, inv, out,
-                                             C.d_partial, C.d_counter, pf ? mn : nullptr, nn, An);
+                                             C.d_partial, C.d_counter, pf ? mn : nullptr, nn, An, lower);
         };
         // S-INVDIAG: block recurrence with the explicit inverses of the diagonal blocks (all fronts of the level
         // in one vbatched gemv per step). L11: x_k = Linv_kk (b_k - L_{k,0:k} x_{0:k}), the b blocks are updated
@@ -2005,7 +2005,7 @@ namespace strumpack {
         for (int k=0; k<K; k++) {
           if (fused && fused_step(IV->mL+k*N, IV->nLu+k*N, IV->maxLu[k], IV->AL+k*N, IV->scr, IV->rhs+k*N,
                                   IV->Li+k*N, IV->scr+k*N,
-                                  k+1 < K ? IV->mL+(k+1)*N : nullptr, IV->nLu+std::min(k+1,K-1)*N, IV->AL+std::min(k+1,K-1)*N)) continue;
+                                  k+1 < K ? IV->mL+(k+1)*N : nullptr, IV->nLu+std::min(k+1,K-1)*N, IV->AL+std::min(k+1,K-1)*N, true)) continue;
           if (k > 0 && IV->maxLu[k] > 0)
             gpu::magma::gemv_vbatched_max_nocheck
               (MagmaNoTrans, IV->mL+k*N, IV->nLu+k*N, scalar_t(-1.), IV->AL+k*N, ld1, IV->scr, inc,
@@ -2024,7 +2024,7 @@ namespace strumpack {
 #endif
             if (fused && fused_step(IV->mL+k*N, upd ? IV->nUu+k*N : IV->nLu, upd ? IV->maxUu[k] : 0, IV->AU+k*N,
                                     IV->rhs+std::min(k+1, K-1)*N, IV->scr+k*N, IV->Ui+k*N, IV->rhs+k*N,
-                                    k > 0 ? IV->mL+(k-1)*N : nullptr, IV->nUu+std::max(k-1,0)*N, IV->AU+std::max(k-1,0)*N)) continue;
+                                    k > 0 ? IV->mL+(k-1)*N : nullptr, IV->nUu+std::max(k-1,0)*N, IV->AU+std::max(k-1,0)*N, false)) continue;
             if (upd)
               gpu::magma::gemv_vbatched_max_nocheck
                 (MagmaNoTrans, IV->mL+k*N, IV->nUu+k*N, scalar_t(-1.), IV->AU+k*N, ld1, IV->rhs+(k+1)*N, inc,

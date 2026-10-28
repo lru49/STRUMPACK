@@ -480,7 +480,7 @@ namespace strumpack {
     template<typename scalar_t> bool
     invdiag_step(Handle& handle, int N, int S, int NB, int chunk, const int* m, const int* n,
                  scalar_t** A, const int* lda, scalar_t** x, scalar_t** yin, scalar_t** inv, scalar_t** out,
-                 scalar_t* partial, int* counter, const int* m_next, const int* n_next, scalar_t** A_next);
+                 scalar_t* partial, int* counter, const int* m_next, const int* n_next, scalar_t** A_next, bool lower);
     template<typename scalar_t> bool
     permute_rows_fwd_vbatched(Handle& handle, int* dn, scalar_t** dA, int* lddA, int** dperm,
                               int* npiv, int max_npiv, unsigned int batchCount);
