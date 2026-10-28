@@ -406,6 +406,9 @@ namespace strumpack {
     virtual const Tree_t* tree() const = 0;
 
     virtual void perf_counters_start();
+    // F-DEVUPDATE: called before the matrix values are read on the host (Krylov / refinement, reorder, pivot
+    // growth); the GPU-updated solver refreshes its host copy here (lazy write-back)
+    virtual void sync_host_matrix_values() {}
     virtual void perf_counters_stop(const std::string& s);
 
     virtual void synchronize() {}

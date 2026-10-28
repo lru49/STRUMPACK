@@ -161,6 +161,7 @@ namespace strumpack {
     }
     scalar_t pgL(0.), pgU(0.);
     auto info = tree()->pivot_growth(pgL, pgU);
+    sync_host_matrix_values();
     pg = std::max(std::abs(pgL), std::abs(pgU)) / matrix()->norm1();
     return info;
   }
@@ -317,6 +318,7 @@ namespace strumpack {
   SparseSolverBase<scalar_t,integer_t>::reorder_internal
   (const int* p, int base, int nx, int ny, int nz,
    int components, int width) {
+    sync_host_matrix_values();   // F-DEVUPDATE: the values are permuted / measured on the host below
     if (!matrix()) return ReturnCode::MATRIX_NOT_SET;
     if (reordered_) return ReturnCode::SUCCESS;
     TaskTimer t1("permute-scale");

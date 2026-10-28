@@ -152,6 +152,11 @@ namespace strumpack {
 
   private:
     CSRMatrix<refine_t,integer_t> mat_;
+    // F-DEVUPDATE/MP: after a same-structure value update the outer (refinement) matrix is the caller's own
+    // matrix (no 455 MB value copy); it must stay alive and unmodified until the next update / set_matrix.
+    // STRUM_MP_ALIAS=0 restores the copy into mat_.
+    const CSRMatrix<refine_t,integer_t>* ext_mat_ = nullptr;
+    const CSRMatrix<refine_t,integer_t>& outer() const { return ext_mat_ ? *ext_mat_ : mat_; }
     SparseSolver<factor_t,integer_t> solver_;
     SPOptions<refine_t> opts_;
     int Krylov_its_ = 0;
