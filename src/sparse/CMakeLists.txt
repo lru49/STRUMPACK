@@ -3,6 +3,7 @@ target_sources(strumpack
   ${CMAKE_CURRENT_LIST_DIR}/MC64ad.cpp
   ${CMAKE_CURRENT_LIST_DIR}/MC64ad.hpp
   ${CMAKE_CURRENT_LIST_DIR}/CompressedSparseMatrix.hpp
+  ${CMAKE_CURRENT_LIST_DIR}/DeviceValueSource.hpp
   ${CMAKE_CURRENT_LIST_DIR}/CompressedSparseMatrix.cpp
   ${CMAKE_CURRENT_LIST_DIR}/CSRGraph.hpp
   ${CMAKE_CURRENT_LIST_DIR}/CSRGraph.cpp
@@ -15,6 +16,7 @@ target_sources(strumpack
 
 install(FILES
   CompressedSparseMatrix.hpp
+  DeviceValueSource.hpp
   CSRMatrix.hpp
   CSRGraph.hpp
   EliminationTree.hpp

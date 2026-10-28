@@ -41,6 +41,9 @@
 #include "sparse/ordering/MatrixReordering.hpp"
 #include "sparse/EliminationTree.hpp"
 #include "iterative/IterativeSolvers.hpp"
+#if defined(STRUMPACK_USE_CUDA)
+#include "sparse/fronts/DeviceValueUpdate.hpp"
+#endif
 
 namespace strumpack {
 
@@ -56,7 +59,25 @@ namespace strumpack {
     (argc, argv, verbose, root) { }
 
   template<typename scalar_t,typename integer_t>
-  SparseSolver<scalar_t,integer_t>::~SparseSolver() = default;
+  SparseSolver<scalar_t,integer_t>::~SparseSolver() {
+    device_update_invalidate();   // F-DEVUPDATE: drop the host registrations while mat_ is still alive
+  }
+
+  template<typename scalar_t,typename integer_t> void
+  SparseSolver<scalar_t,integer_t>::host_values_updated() {
+#if defined(STRUMPACK_USE_CUDA)
+    if (devupd_) devupd_->host_values_changed();
+#endif
+    if (mat_) mat_->set_device_value_source(nullptr);
+  }
+
+  template<typename scalar_t,typename integer_t> void
+  SparseSolver<scalar_t,integer_t>::device_update_invalidate() {
+#if defined(STRUMPACK_USE_CUDA)
+    if (devupd_) devupd_->invalidate();
+#endif
+    if (mat_) mat_->set_device_value_source(nullptr);
+  }
 
 
   template<typename scalar_t,typename integer_t> void
@@ -87,6 +108,7 @@ namespace strumpack {
   template<typename scalar_t,typename integer_t> void
   SparseSolver<scalar_t,integer_t>::set_matrix
   (const CSRMatrix<scalar_t,integer_t>& A) {
+    device_update_invalidate();
     mat_.reset(new CSRMatrix<scalar_t,integer_t>(A));
     factored_ = reordered_ = false;
   }
@@ -111,6 +133,7 @@ namespace strumpack {
       }
       mat_ptr[row + 1] += mat_ptr[row];
     }
+    device_update_invalidate();
     mat_.reset(new CSRMatrix<scalar_t, integer_t>(
         integer_t(mat_ptr.size() - 1), mat_ptr.data(), mat_ind.data(),
         mat_val.data()));
@@ -126,6 +149,7 @@ namespace strumpack {
       return;
     }
     if (update_values_cached(A.size(), A.ptr(), A.ind(), A.val())) return;
+    device_update_invalidate();
     mat_.reset(new CSRMatrix<scalar_t,integer_t>(A));
     permute_matrix_values();
     build_update_cache(A.size(), A.ptr(), A.ind(), A.symm_sparse());
@@ -136,17 +160,38 @@ namespace strumpack {
   (integer_t N, const integer_t* ptr, const integer_t* ind, const scalar_t* val) {
     if (!upd_valid_ || !reordered_ || N != upd_N_ ||
         ptr[N] != upd_ptr_[N]) return false;
-    if (!std::equal(upd_ptr_.begin(), upd_ptr_.end(), ptr) ||
-        !std::equal(upd_ind_.begin(), upd_ind_.end(), ind)) {
+    // structure check (STRUM_UPDATE_CHECK=0 skips the ind compare, 227 MB for the JOREK proxy, and
+    // trusts the caller's same-sparsity promise as upstream STRUMPACK does)
+    static const bool full_check = !(std::getenv("STRUM_UPDATE_CHECK") &&
+                                     std::atoi(std::getenv("STRUM_UPDATE_CHECK")) == 0);
+    bool same = std::equal(upd_ptr_.begin(), upd_ptr_.end(), ptr);
+    if (same && full_check) {
+      const std::size_t nnz_in = upd_ind_.size();
+      const integer_t* uind = upd_ind_.data();
+      bool diff = false;
+#pragma omp parallel for reduction(||:diff) schedule(static)
+      for (std::size_t k=0; k<nnz_in; k++) diff = diff || (uind[k] != ind[k]);
+      same = !diff;
+    }
+    if (!same) {
       upd_valid_ = false;   // structure changed: rebuild through the full path
       return false;
     }
+#if defined(STRUMPACK_USE_CUDA)
+    // F-DEVUPDATE: raw values -> device, gather there; returns before the copy is done
+    if (devupd_ && devupd_->update(val, std::size_t(ptr[N]))) {
+      mat_->set_device_value_source(devupd_.get());
+      factored_ = false;
+      return true;
+    }
+#endif
     const std::size_t nnz = mat_->nnz();
     auto v = mat_->val();
     const auto map = upd_map_.data();
 #pragma omp parallel for
     for (std::size_t k=0; k<nnz; k++)
       v[k] = map[k] > 0 ? val[map[k]-1] : scalar_t(0.);
+    host_values_updated();
     factored_ = false;
     return true;
   }
@@ -182,12 +227,21 @@ namespace strumpack {
     upd_ind_.assign(ind, ind+nnz_in);
     upd_N_ = N;
     upd_valid_ = true;
+#if defined(STRUMPACK_USE_CUDA)
+    // F-DEVUPDATE: the map goes to the device once; later updates gather there
+    if (gpu::DeviceValueUpdater<scalar_t,integer_t>::enabled()) {
+      if (!devupd_) devupd_.reset(new gpu::DeviceValueUpdater<scalar_t,integer_t>());
+      if (!devupd_->set_map(upd_map_.data(), nnz, nnz_in, mat_->val()))
+        devupd_->invalidate();
+    }
+#endif
   }
 
   template<typename scalar_t,typename integer_t> void
   SparseSolver<scalar_t,integer_t>::set_csr_matrix
   (integer_t N, const integer_t* row_ptr, const integer_t* col_ind,
    const scalar_t* values, bool symmetric_pattern) {
+    device_update_invalidate();
     mat_.reset(new CSRMatrix<scalar_t,integer_t>
                (N, row_ptr, col_ind, values, symmetric_pattern));
     factored_ = reordered_ = false;
@@ -203,6 +257,7 @@ namespace strumpack {
       return;
     }
     if (update_values_cached(N, row_ptr, col_ind, values)) return;
+    device_update_invalidate();
     mat_.reset(new CSRMatrix<scalar_t,integer_t>
                (N, row_ptr, col_ind, values, symmetric_pattern));
     permute_matrix_values();

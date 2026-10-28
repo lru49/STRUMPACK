@@ -41,6 +41,10 @@
 
 #include "SparseSolverBase.hpp"
 
+namespace strumpack { namespace gpu {
+  template<typename scalar_t, typename integer_t> class DeviceValueUpdater;   // F-DEVUPDATE
+} }
+
 /**
  * All of STRUMPACK is contained in the strumpack namespace.
  */
@@ -269,9 +273,17 @@ namespace strumpack {
 #pragma omp parallel for
       for (std::size_t k=0; k<nnz; k++)
         v[k] = map[k] > 0 ? scalar_t(val[map[k]-1]) : scalar_t(0.);
+      host_values_updated();
       this->factored_ = false;
       return true;
     }
+    // F-DEVUPDATE: the device-side update (sparse/fronts/DeviceValueUpdate.hpp); the matrix' host values are
+    // then refreshed asynchronously and the factorization takes the values from the device
+    void host_values_updated();   // host path wrote mat_->val(): the device copy is stale
+    void device_update_invalidate();   // before mat_ is replaced
+#if defined(STRUMPACK_USE_CUDA)
+    std::unique_ptr<gpu::DeviceValueUpdater<scalar_t,integer_t>> devupd_;
+#endif
 
     void build_update_cache(integer_t N, const integer_t* ptr, const integer_t* ind, bool symm_sparsity);
     std::vector<integer_t> upd_map_, upd_ptr_, upd_ind_;

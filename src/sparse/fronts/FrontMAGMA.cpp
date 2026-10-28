@@ -500,7 +500,7 @@ namespace strumpack {
     gpu::HostMemory<char> meta_hmem;     // host mirror (gpu::assemble reads the host AssembleData)
     std::vector<char*> level_factors, level_work;
     std::vector<gpu::AssembleData<scalar_t>*> h_asmbl, d_asmbl;
-    gpu::DeviceMemory<scalar_t> d_vals;  // A.val() on the device, refreshed every factorization
+    gpu::DeviceMemory<scalar_t> d_vals;  // A.val() on the device, refreshed every factorization (host-copy path only)
     gpu::DeviceMemory<int> d_src;        // gather map, all levels concatenated
     gpu::DeviceMemory<unsigned> d_dst;
     std::vector<std::size_t> map_off;    // lvls+1 offsets into d_src/d_dst
@@ -545,7 +545,22 @@ namespace strumpack {
     auto& C = *factor_cache_;
     gpu::Stream comp_stream;
     gpu::Handle handle(comp_stream);
-    {
+    // F-DEVUPDATE: when the value update ran on the device, the permuted values are already there
+    // (the source waits for its upload and verifies it); nothing is copied at the start of the factorization
+    const scalar_t* vals = nullptr;
+    DeviceValueSource<scalar_t>* dsrc = A.device_value_source();
+    unsigned long long dgen = 0;
+    if (dsrc) vals = dsrc->device_values(C.nnz, &dgen);
+    if (vals) {
+      C.d_vals.release();   // the host-copy buffers are not needed while the device source is current
+      C.h_vals.release();
+      if (opts.verbose())
+        std::cout << "# F-DEVUPDATE: CSR values taken from the device (generation " << dgen
+                  << "), no host copy" << std::endl;
+    } else {
+      dsrc = nullptr;
+      if (C.d_vals.size() < C.nnz) C.d_vals = gpu::DeviceMemory<scalar_t>(C.nnz);
+      vals = C.d_vals;
       static const bool pin = !(std::getenv("STRUM_PIN_VALUES") &&
                                 std::atoi(std::getenv("STRUM_PIN_VALUES")) == 0);
       if (pin) {
@@ -574,7 +589,7 @@ namespace strumpack {
         // default stream: gather of this level's sparse entries, then extend-add
         gpu::gather_front_elements<scalar_t>
           (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
-           C.d_dst + C.map_off[l], C.d_vals, fbase);
+           C.d_dst + C.map_off[l], vals, fbase);
         gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l]);
 
         std::size_t N = L.f.size(), Nsmall = L.Nsmall;
@@ -661,6 +676,7 @@ namespace strumpack {
       STRUMPACK_FULL_RANK_FLOPS(level_flops);
       STRUMPACK_FLOPS(small_flops);
     }
+    if (dsrc) dsrc->release_device_values();   // F-DEVUPDATE: host write-back done (overlapped the kernels above)
     return err_code;
   }
 
@@ -691,7 +707,7 @@ namespace strumpack {
     dev_factors_.reset(new gpu::DeviceMemory<char>(C.total_factor_dmem));
     C.meta_dmem = gpu::DeviceMemory<char>(meta_bytes);
     C.meta_hmem = gpu::HostMemory<char>(meta_bytes);
-    C.d_vals = gpu::DeviceMemory<scalar_t>(C.nnz);
+    // C.d_vals (A.val() on the device) is allocated on first use: not needed when the values come from the device
     C.level_factors.assign(lvls, nullptr); C.level_work.assign(lvls, nullptr);
     C.h_asmbl.assign(lvls, nullptr); C.d_asmbl.assign(lvls, nullptr);
     std::vector<int> src(C.nmap);

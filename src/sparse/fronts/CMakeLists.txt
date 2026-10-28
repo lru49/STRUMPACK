@@ -52,6 +52,10 @@ endif()
 if(STRUMPACK_USE_CUDA)
   target_sources(strumpack PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/FrontCUDA.cu
+    ${CMAKE_CURRENT_LIST_DIR}/DeviceValueUpdate.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/DeviceValueUpdateKernels.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/DeviceValueUpdate.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DeviceValueUpdate.cu
     ${CMAKE_CURRENT_LIST_DIR}/FrontGPUSPD.cu
     ${CMAKE_CURRENT_LIST_DIR}/FrontGPUSPD.cpp
     ${CMAKE_CURRENT_LIST_DIR}/FrontGPUSPD.hpp)
