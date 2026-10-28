@@ -883,7 +883,18 @@ namespace strumpack {
     unsigned long long dgen = 0;
     if (dsrc) vals = gs ? dsrc->device_values_on_stream(C.nnz, &dgen, gpu::get_cuda_stream(*gs))
                         : dsrc->device_values(C.nnz, &dgen);
-    if (vals) {
+    if (vals && gs) {
+      // F-GRAPH: the graphs bake the value pointer in, so the gathers always read C.d_vals: copy the device
+      // source's values there (D2D, ~0.5 ms for 455 MB) instead of switching the pointer (which would force a
+      // re-capture at the first device-sourced refactorization). C.h_vals is not needed.
+      if (C.d_vals.size() < C.nnz) C.d_vals = gpu::DeviceMemory<scalar_t>(C.nnz);
+      C.h_vals.release();
+      gpu::copy_device_to_device_async<scalar_t>(C.d_vals, vals, C.nnz, *gs);
+      vals = C.d_vals;
+      if (opts.verbose())
+        std::cout << "# F-DEVUPDATE: CSR values taken from the device (generation " << dgen
+                  << "), D2D into the graph's value buffer" << std::endl;
+    } else if (vals) {
       C.d_vals.release();   // the host-copy buffers are not needed while the device source is current
       C.h_vals.release();
       if (opts.verbose())

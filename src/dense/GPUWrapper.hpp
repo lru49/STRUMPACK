@@ -265,6 +265,11 @@ namespace strumpack {
                               std::size_t count, Stream& s) {
       device_copy_async(dptr, hptr, count*sizeof(T), CopyDir::H2D, s);
     }
+    template<typename T> void
+    copy_device_to_device_async(T* d1ptr, const T* d2ptr,
+                                std::size_t count, Stream& s) {
+      device_copy_async(d1ptr, d2ptr, count*sizeof(T), CopyDir::D2D, s);
+    }
 
     template<typename T> void
     copy_async(DenseMatrix<T>& h, const DenseMatrix<T>& d,
