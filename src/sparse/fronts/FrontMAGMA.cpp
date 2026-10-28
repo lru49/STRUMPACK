@@ -27,6 +27,8 @@
  *
  */
 #include <array>
+#include <chrono>
+#include <string>
 #include <cstdlib>
 #if defined(STRUMPACK_USE_CUDA)
 #include <cuda_runtime_api.h>
@@ -69,6 +71,99 @@ namespace strumpack {
          ld1+i, ipiv+i, info+i, work, lwork, std::min(max_batch, N-i),
          handle);
   }
+
+  // F-GRAPH (magma-hpc F track, 2026-10-27): CUDA-graph capture/replay of the
+  // factorization levels and of the solve. Every refactorization with the same
+  // sparsity issues the same kernel sequence with the same arguments (the
+  // factor/work/meta device buffers are persistent since F-GATHER), so each
+  // level is captured once (cudaStreamBeginCapture .. EndCapture ->
+  // cudaGraphInstantiate) on the first factorization and replayed with one
+  // cudaGraphLaunch afterwards; same for the whole solve sequence.
+  //   STRUM_GRAPH=1       per-level factorization graphs (default 0 = off)
+  //   STRUM_GRAPH=2       one graph for the whole factorization
+  //   STRUM_GRAPH_SOLVE   solve graph (default = STRUM_GRAPH != 0)
+  //   STRUM_GRAPH_RELAXED capture mode relaxed instead of thread-local
+  //   STRUM_GRAPH_LOG=1   print graph sizes / instantiate times
+  static int graph_env_int(const char* name, int def) {
+    const char* e = std::getenv(name);
+    return (e && e[0]) ? std::atoi(e) : def;
+  }
+  static int graph_mode() {
+    static const int m = graph_env_int("STRUM_GRAPH", 0);
+    return m;
+  }
+  static bool graph_solve_on() {
+    static const bool on = graph_env_int("STRUM_GRAPH_SOLVE", graph_mode() != 0 ? 1 : 0) != 0;
+    return on;
+  }
+  static bool graph_log() {
+    static const bool on = graph_env_int("STRUM_GRAPH_LOG", 0) != 0;
+    return on;
+  }
+#if defined(STRUMPACK_USE_CUDA)
+  struct GraphExecHolder {
+    cudaGraphExec_t exec = nullptr;
+    std::size_t nodes = 0;
+    double instantiate_ms = 0.;
+    std::size_t launches = 0;
+    GraphExecHolder() = default;
+    GraphExecHolder(const GraphExecHolder&) = delete;
+    GraphExecHolder& operator=(const GraphExecHolder&) = delete;
+    GraphExecHolder(GraphExecHolder&& o) noexcept { *this = std::move(o); }
+    GraphExecHolder& operator=(GraphExecHolder&& o) noexcept {
+      if (this != &o) { reset(); exec = o.exec; nodes = o.nodes; instantiate_ms = o.instantiate_ms;
+        launches = o.launches; o.exec = nullptr; }
+      return *this;
+    }
+    ~GraphExecHolder() { reset(); }
+    bool valid() const { return exec != nullptr; }
+    void reset() {
+      if (exec) { cudaGraphExecDestroy(exec); exec = nullptr; }
+      nodes = 0; launches = 0;
+    }
+  };
+  static bool graph_begin(gpu::Stream& s) {
+    static const bool relaxed = graph_env_int("STRUM_GRAPH_RELAXED", 0) != 0;
+    auto e = cudaStreamBeginCapture
+      (gpu::get_cuda_stream(s), relaxed ? cudaStreamCaptureModeRelaxed : cudaStreamCaptureModeThreadLocal);
+    if (e != cudaSuccess) {
+      std::cerr << "# F-GRAPH: cudaStreamBeginCapture failed: " << cudaGetErrorString(e) << std::endl;
+      (void)cudaGetLastError();
+      return false;
+    }
+    return true;
+  }
+  // ends the capture and instantiates; false (and nothing executed) if the capture was invalidated
+  static bool graph_end(gpu::Stream& s, GraphExecHolder& G, const char* what) {
+    cudaGraph_t g = nullptr;
+    auto e = cudaStreamEndCapture(gpu::get_cuda_stream(s), &g);
+    if (e != cudaSuccess || !g) {
+      std::cerr << "# F-GRAPH: capture of " << what << " failed: " << cudaGetErrorString(e)
+                << " (running the sequence eagerly)" << std::endl;
+      (void)cudaGetLastError();
+      if (g) cudaGraphDestroy(g);
+      return false;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    cudaGraphGetNodes(g, nullptr, &G.nodes);
+    e = cudaGraphInstantiate(&G.exec, g, 0);
+    cudaGraphDestroy(g);
+    if (e != cudaSuccess) {
+      std::cerr << "# F-GRAPH: cudaGraphInstantiate of " << what << " failed: " << cudaGetErrorString(e) << std::endl;
+      (void)cudaGetLastError();
+      G.exec = nullptr; G.nodes = 0;
+      return false;
+    }
+    G.instantiate_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (graph_log())
+      std::cout << "# F-GRAPH " << what << " nodes " << G.nodes << " instantiate_ms " << G.instantiate_ms << std::endl;
+    return true;
+  }
+  static void graph_launch(GraphExecHolder& G, gpu::Stream& s) {
+    gpu_check(cudaGraphLaunch(G.exec, gpu::get_cuda_stream(s)));
+    G.launches++;
+  }
+#endif
 
   template<typename scalar_t, typename integer_t> class LevelInfoMAGMA {
     using F_t = Front<scalar_t,integer_t>;
@@ -312,6 +407,12 @@ namespace strumpack {
       d_rhs_batch, d_bupd_batch;
     // Counters for STRUM_LAUNCH2_LOG / STRUM_LAUNCH2_VERIFY.
     std::size_t n_solves = 0, n_meta_uploads = 0, n_mem_uploads = 0;
+    // F-GRAPH: the pivot permutations were derived from the factorization with this epoch
+    unsigned perm_epoch = 0;
+#if defined(STRUMPACK_USE_CUDA)
+    GraphExecHolder graph;        // the whole solve (H2D of the staged rhs .. D2H of the solution)
+    const void* gkey[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};   // pointers the captured graph bakes in
+#endif
   };
 
   // S-HOST: device copy of the sparse reordering permutation, cached across solves. Rebuilt after every
@@ -512,6 +613,15 @@ namespace strumpack {
     // stale memory. Now: a STRUMPACK-owned pinned staging buffer, filled chunk by chunk (OpenMP memcpy) while the
     // previous chunk's async DMA runs on the compute stream.
     gpu::HostMemory<scalar_t> h_vals;    // pinned staging, nnz values
+    // F-GRAPH: persistent stream + handle (the cuBLAS/cuSOLVER/MAGMA handles and their workspaces were created and
+    // destroyed at every factorization: the 7 cudaMalloc / 22 cudaFree per refactorization), the per-level (or
+    // whole-factorization) executable graphs and a factorization counter (replays start with the second one).
+    std::unique_ptr<gpu::Stream> stream;
+    std::unique_ptr<gpu::Handle> handle;
+#if defined(STRUMPACK_USE_CUDA)
+    std::vector<GraphExecHolder> graphs;
+#endif
+    std::size_t nfact = 0;
   };
 
   template<typename scalar_t,typename integer_t> ReturnCode
@@ -538,13 +648,37 @@ namespace strumpack {
         return factors_on_device_legacy(A, opts, ldata, total_dmem);
       }
       build_factor_cache(A, ldata);
+      solve_cache_.reset();   // new factor memory: the solve workspace (and its F-GRAPH graph) must be rebuilt
+      devperm_.reset();
     }
     ReturnCode err_code = ReturnCode::SUCCESS;
-    solve_cache_.reset(); // new factors: rebuild the solve workspace
-    devperm_.reset();     // S-HOST: and the device permutation
     auto& C = *factor_cache_;
-    gpu::Stream comp_stream;
-    gpu::Handle handle(comp_stream);
+    const int gmode = graph_mode();           // 0 off, 1 per-level graphs, 2 one graph for all levels
+    const bool gsolve = graph_solve_on();
+    const bool persistent = gmode != 0 || gsolve;
+    if (persistent) {
+      // F-GRAPH: the solve cache survives a same-structure refactorization (its device meta-data and the factor
+      // pointers stay valid, the solve graph with them); only the pivot permutations are re-derived (perm_epoch).
+      if (!C.stream) {
+        C.stream.reset(new gpu::Stream());
+        C.handle.reset(new gpu::Handle(*C.stream));
+      }
+      factor_epoch_++;
+    } else {
+      solve_cache_.reset(); // new factors: rebuild the solve workspace
+      devperm_.reset();     // S-HOST: and the device permutation
+    }
+    std::unique_ptr<gpu::Stream> tmp_stream;
+    std::unique_ptr<gpu::Handle> tmp_handle;
+    if (!C.stream) {
+      tmp_stream.reset(new gpu::Stream());
+      tmp_handle.reset(new gpu::Handle(*tmp_stream));
+    }
+    gpu::Stream& comp_stream = C.stream ? *C.stream : *tmp_stream;
+    gpu::Handle& handle = C.handle ? *C.handle : *tmp_handle;
+    // gs != nullptr: every device operation of a level is issued on comp_stream (capturable); otherwise the
+    // original mix of legacy-default-stream kernels (memset/gather/assemble) and MAGMA on comp_stream is kept.
+    gpu::Stream* gs = gmode ? &comp_stream : nullptr;
     {
       static const bool pin = !(std::getenv("STRUM_PIN_VALUES") &&
                                 std::atoi(std::getenv("STRUM_PIN_VALUES")) == 0);
@@ -561,21 +695,39 @@ namespace strumpack {
           for (std::size_t k=lo; k<hi; k++) stg[k] = src[k];
           gpu::copy_host_to_device_async<scalar_t>(dst+lo, stg+lo, hi-lo, comp_stream);
         }
-        comp_stream.synchronize();   // the gathers below run on the default stream
+        if (!gs) comp_stream.synchronize();   // the gathers below run on the default stream
       } else
         gpu::copy_host_to_device<scalar_t>(C.d_vals, A.val(), C.nnz);
     }
     scalar_t* fbase = dev_factors_->template as<scalar_t>();
-    for (int l=C.lvls-1; l>=0; l--) {
+    static const int large_lu = std::getenv("STRUM_LARGE_LU") ?
+      std::atoi(std::getenv("STRUM_LARGE_LU")) : 0;   // default OFF (window 102: +3.4 %, NO-GO); 0 = off
+    static const int large_gemm_d2 = std::getenv("STRUM_LARGE_GEMM") ?
+      std::atoi(std::getenv("STRUM_LARGE_GEMM")) : 0;   // default OFF (window 102: +4.2 %, NO-GO); 0 = off
+    // F-TOPLU goes through magma_Xgetrf_native (own queues, host pivot copies): not capturable
+    auto level_capturable = [&](int l) {
+      return !(large_lu > 0 && C.ldata[l].max_d1_small > large_lu);
+    };
+    // the GPU work of one level: zero, gather the sparse entries, extend-add, LU, laswp, trsm, Schur update
+    auto run_level = [&](int l) {
       auto& L = C.ldata[l];
       try {
-        gpu::memset<scalar_t>(C.level_work[l], 0, L.Schur_size);
-        gpu::memset<scalar_t>(C.level_factors[l], 0, L.factor_size);
-        // default stream: gather of this level's sparse entries, then extend-add
-        gpu::gather_front_elements<scalar_t>
-          (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
-           C.d_dst + C.map_off[l], C.d_vals, fbase);
-        gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l]);
+        if (gs) {
+          gpu::memset_async<scalar_t>(C.level_work[l], 0, L.Schur_size, *gs);
+          gpu::memset_async<scalar_t>(C.level_factors[l], 0, L.factor_size, *gs);
+          gpu::gather_front_elements<scalar_t>
+            (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
+             C.d_dst + C.map_off[l], C.d_vals, fbase, *gs);
+          gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l], *gs);
+        } else {
+          gpu::memset<scalar_t>(C.level_work[l], 0, L.Schur_size);
+          gpu::memset<scalar_t>(C.level_factors[l], 0, L.factor_size);
+          // default stream: gather of this level's sparse entries, then extend-add
+          gpu::gather_front_elements<scalar_t>
+            (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
+             C.d_dst + C.map_off[l], C.d_vals, fbase);
+          gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l]);
+        }
 
         std::size_t N = L.f.size(), Nsmall = L.Nsmall;
         auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
@@ -583,8 +735,6 @@ namespace strumpack {
         auto F11 = L.dev_F_batch;   auto F12 = F11 + Nsmall;
         auto F21 = F12 + Nsmall;    auto F22 = F21 + Nsmall;
 
-        static const int large_lu = std::getenv("STRUM_LARGE_LU") ?
-          std::atoi(std::getenv("STRUM_LARGE_LU")) : 0;   // default OFF (window 102: +3.4 %, NO-GO); 0 = off
         if (large_lu > 0 && L.max_d1_small > large_lu) {
           // F-TOPLU: every front of this level individually (levels with such fronts hold 1-8 fronts)
           std::vector<magma_int_t> piv;
@@ -614,7 +764,7 @@ namespace strumpack {
           for (std::size_t i=Nsmall; i<N; i++)
             gpu::replace_pivots
               (L.f[i]->F11_.rows(), L.f[i]->F11_.data(),
-               opts.pivot_threshold());
+               opts.pivot_threshold(), gs);
         }
         gpu::laswp_fwd_vbatched
           (handle, d2, L.max_d2_small, F12, ld1, L.dev_ipiv_batch,
@@ -631,8 +781,6 @@ namespace strumpack {
           gpu::getrs
             (handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_,
              L.f[i]->F12_, L.dev_getrf_err+i);
-        static const int large_gemm_d2 = std::getenv("STRUM_LARGE_GEMM") ?
-          std::atoi(std::getenv("STRUM_LARGE_GEMM")) : 0;   // default OFF (window 102: +4.2 %, NO-GO); 0 = off
         if (large_gemm_d2 > 0 && L.max_d2_small > large_gemm_d2) {
           // F-GEMM-TOP: one fixed-size gemm launch per front (levels with such fronts hold 1-250 fronts)
           auto q = gpu::get_magma_queue(handle);
@@ -656,10 +804,65 @@ namespace strumpack {
         std::cerr << "Out of memory" << std::endl;
         abort();
       }
+    };
+    auto count_flops = [&](int l) {
       long long level_flops, small_flops;
-      L.flops(level_flops, small_flops);
+      C.ldata[l].flops(level_flops, small_flops);
       STRUMPACK_FULL_RANK_FLOPS(level_flops);
       STRUMPACK_FLOPS(small_flops);
+    };
+#if defined(STRUMPACK_USE_CUDA)
+    if (gmode == 2) {
+      // one graph for the whole factorization
+      if (C.graphs.size() < 1) C.graphs.resize(1);
+      auto& G = C.graphs[0];
+      bool all_capturable = true;
+      for (int l=0; l<C.lvls; l++) all_capturable = all_capturable && level_capturable(l);
+      if (G.valid()) graph_launch(G, comp_stream);
+      else {
+        bool captured = all_capturable && graph_begin(comp_stream);
+        if (captured) {
+          for (int l=C.lvls-1; l>=0; l--) run_level(l);
+          captured = graph_end(comp_stream, G, "factorization");
+        }
+        if (captured) graph_launch(G, comp_stream);
+        else for (int l=C.lvls-1; l>=0; l--) run_level(l);
+      }
+      for (int l=C.lvls-1; l>=0; l--) count_flops(l);
+    } else if (gmode != 0) {
+      // one graph per level
+      if (C.graphs.size() < std::size_t(C.lvls)) C.graphs.resize(C.lvls);
+      for (int l=C.lvls-1; l>=0; l--) {
+        auto& G = C.graphs[l];
+        if (G.valid()) {
+          int lg = l;
+#if defined(STRUM_PLANT_GRAPH)
+          // PLANT: on replays, level lvls/2 is "updated" with the graph of the level below it (idempotent for
+          // that level, so level lvls/2 keeps the factors of the previous factorization): must FAIL the compare
+          if (C.nfact > 0 && l == C.lvls/2 && l >= 1 && C.graphs[l-1].valid()) lg = l-1;
+#endif
+          graph_launch(C.graphs[lg], comp_stream);
+        } else {
+          bool captured = level_capturable(l) && graph_begin(comp_stream);
+          if (captured) {
+            run_level(l);
+            captured = graph_end(comp_stream, G, (std::string("level ") + std::to_string(l)).c_str());
+          }
+          if (captured) graph_launch(G, comp_stream);
+          else run_level(l);
+        }
+        count_flops(l);
+      }
+    } else
+#endif
+    for (int l=C.lvls-1; l>=0; l--) {
+      run_level(l);
+      count_flops(l);
+    }
+    C.nfact++;
+    if (persistent) {
+      if (!factor_done_) factor_done_.reset(new gpu::Event());
+      factor_done_->record(comp_stream);
     }
     return err_code;
   }
@@ -694,6 +897,9 @@ namespace strumpack {
     C.d_vals = gpu::DeviceMemory<scalar_t>(C.nnz);
     C.level_factors.assign(lvls, nullptr); C.level_work.assign(lvls, nullptr);
     C.h_asmbl.assign(lvls, nullptr); C.d_asmbl.assign(lvls, nullptr);
+#if defined(STRUMPACK_USE_CUDA)
+    C.graphs.clear();   // F-GRAPH: captured on the first factorization with this structure
+#endif
     std::vector<int> src(C.nmap);
     std::vector<unsigned> dst(C.nmap);
     char* factors_dptr = dev_factors_->template as<char>();
@@ -916,6 +1122,12 @@ namespace strumpack {
                   << " elems " << L.elems11.back() + L.elems12.back() + L.elems21.back()
                   << " sum_d1d2 " << sum_d1d2 << " sum_d1sq " << sum_d1sq << std::endl;
       }
+    }
+    if (graph_mode() != 0 || graph_solve_on()) {
+      // F-GRAPH: the solve stream waits on this instead of relying on legacy-default-stream ordering
+      factor_done_.reset(new gpu::Event());
+      factor_done_->record(comp_stream);
+      factor_epoch_++;
     }
     return err_code;
   }
@@ -1469,8 +1681,12 @@ namespace strumpack {
         ldata[l].set_batch_data(C.d_meta.template as<char>() + meta_off[l]);
         C.n_meta_uploads++;
       }
-      // S-LASWP: build the per-front permutations from the pivots (once per factorization / cache)
-      static const bool solve_perm = !(std::getenv("STRUM_SOLVE_PERM") && std::atoi(std::getenv("STRUM_SOLVE_PERM")) == 0);
+    }
+    // F-GRAPH: the factorization no longer ends on the legacy default stream; order the solve stream after it
+    if (factor_done_) factor_done_->wait(C.comp_stream);
+    // S-LASWP: build the per-front permutations from the pivots (once per factorization / cache)
+    static const bool solve_perm = !(std::getenv("STRUM_SOLVE_PERM") && std::atoi(std::getenv("STRUM_SOLVE_PERM")) == 0);
+    if (fresh) {
       C.perm_ready = false;
       if (solve_perm) {
         std::size_t tot = 0;
@@ -1487,12 +1703,16 @@ namespace strumpack {
           for (std::size_t i=0; i<L.f.size(); i++) { hp[l_off[l]+i] = base + off; off += L.f[i]->dim_sep(); }
         }
         gpu::copy_host_to_device<int*>(C.d_perm_ptrs, hp.data(), Ntotal + 1);
-        for (int l=lvls-1; l>=0; l--) {
-          auto& L = ldata[l];
-          if (L.Nsmall) gpu::ipiv_to_perm_vbatched(handle, L.dev_ipiv_batch, L.dev_d1_batch, C.perm_batch[l], L.Nsmall);
-        }
-        C.perm_ready = true;
       }
+    }
+    if (solve_perm && (fresh || C.perm_epoch != factor_epoch_)) {
+      // F-GRAPH: the solve cache survives refactorizations, the pivots do not: re-derive the permutations
+      for (int l=lvls-1; l>=0; l--) {
+        auto& L = ldata[l];
+        if (L.Nsmall) gpu::ipiv_to_perm_vbatched(handle, L.dev_ipiv_batch, L.dev_d1_batch, C.perm_batch[l], L.Nsmall);
+      }
+      C.perm_ready = true;
+      C.perm_epoch = factor_epoch_;
     }
     C.n_solves++;
     // copy rhs, from pageable memory (input)
@@ -1501,153 +1721,194 @@ namespace strumpack {
     // the compute stream. STRUM_RHS_PIN=0 restores the pageable copies.
     static const bool rhs_pin = !(std::getenv("STRUM_RHS_PIN") && std::atoi(std::getenv("STRUM_RHS_PIN")) == 0);
     const std::size_t nb_elems = std::size_t(b.rows()) * nrhs;
-    if (dp) {
-      // S-HOST (magma-hpc, 2026-10-27): the right-hand side arrives RAW; stage it pinned, upload it and apply the
-      // sparse reordering on the device, d_b(i,:) = braw(iperm[i],:), instead of the host pass in transform_b.
-      const DenseM_t& br = *dp->braw;
-      if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems);
-      if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems);
-      scalar_t* hb = C.h_b;
-      scalar_t* d_braw = C.d_braw;
-      if (br.ld() == br.rows()) std::copy(br.data(), br.data() + nb_elems, hb);
-      else for (int j=0; j<nrhs; j++) std::copy(br.ptr(0, j), br.ptr(0, j) + br.rows(), hb + std::size_t(j) * br.rows());
-      gpu::copy_host_to_device_async<scalar_t>(d_braw, hb, nb_elems, C.comp_stream);
-      gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_braw, d_b, dp->d_iperm);
-    } else if (rhs_pin) {
-      if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems);
-      scalar_t* hb = C.h_b;
-      if (b.ld() == b.rows()) std::copy(b.data(), b.data() + nb_elems, hb);
-      else for (int j=0; j<nrhs; j++) std::copy(b.ptr(0, j), b.ptr(0, j) + b.rows(), hb + std::size_t(j) * b.rows());
-      gpu::copy_host_to_device_async<scalar_t>(d_b, hb, nb_elems, C.comp_stream);
-    } else
-      gpu::copy_host_to_device<scalar_t>(d_b, b);
-
     // S-NOSYNC (magma-hpc, 2026-10-27): the per-level host-side synchronizations below are not needed for
     // correctness: comp_stream is a blocking stream (cudaStreamCreate), so its kernels are ordered against the
     // memsets / extend-add / extract kernels on the legacy default stream implicitly. Each host sync drained the
     // GPU and exposed the next level's launch latency (61 syncs, ~2-4 ms of idle per solve). STRUM_SOLVE_SYNC=1
     // restores them (A/B arm).
     static const bool solve_sync = std::getenv("STRUM_SOLVE_SYNC") && std::atoi(std::getenv("STRUM_SOLVE_SYNC")) == 1;
-    // forward solve
-    for (int l=lvls-1; l>=0; l--) {
-      if (solve_sync) gpu::synchronize_default_stream();
-      auto& L = ldata[l];
-      std::size_t N = L.f.size(), Nsmall = L.Nsmall;
-      // batch meta-data was uploaded once, see above (L.dev_*_batch)
-      auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
-      auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
-      auto F11 = L.dev_F_batch;   auto F21 = F11 + 2*Nsmall;
-      gpu::memset<scalar_t>
-        ((l % 2) ? d_bupd_odd : d_bupd_even, 0, L.total_upd_size*nrhs);
-      if (l != lvls-1)
-        gpu::extend_add_rhs
-          (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
-      // TODO remove?
-      if (solve_sync) gpu::synchronize_default_stream();
-      if (!(C.perm_ready && Nsmall &&
-            gpu::permute_rows_fwd_vbatched<scalar_t>
-            (handle, nrhs_batch+Nmax-Nsmall, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
-             C.perm_batch[l], d1, L.max_d1_small, Nsmall)))
-        gpu::laswp_fwd_vbatched
-          (handle, nrhs_batch+Nmax-Nsmall, nrhs,
-           d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
-           L.dev_ipiv_batch, d1, Nsmall);
-      gpu::magma::trsm_vbatched_max_nocheck
-        (MagmaLeft, MagmaLower, MagmaNoTrans, MagmaUnit,
-         L.max_d1_small, nrhs, d1, nrhs_batch+Nmax-Nsmall, scalar_t(1.),
-         F11, ld1, d_rhs_batch[l], ldrhs_batch+Nmax-
-         Nsmall, Nsmall, handle);
-      gpu::magma::trsm_vbatched_max_nocheck
-        (MagmaLeft, MagmaUpper, MagmaNoTrans, MagmaNonUnit,
-         L.max_d1_small, nrhs, d1, nrhs_batch+Nmax-Nsmall, scalar_t(1.),
-         F11, ld1, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
-         Nsmall, handle);
-      for (std::size_t i=Nsmall; i<N; i++) {
-        DenseMW_t fb(L.f[i]->dim_sep(), nrhs, h_rhs_batch[l][i], b.rows());
-        gpu::getrs(handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_, fb, getrs_err);
-      }
-      if (l == 0) break;
-      if (nrhs == 1)
-        gpu::magma::gemv_vbatched_max_nocheck
-          (MagmaNoTrans, d2, d1, scalar_t(-1.),
-           F21, ld2, d_rhs_batch[l], inc_batch+Nmax-Nsmall, scalar_t(1.),
-           d_bupd_batch[l], inc_batch+Nmax-Nsmall, Nsmall,
-           L.max_d2_small, L.max_d1_small, handle);
-      else
-        gpu::magma::gemm_vbatched_max_nocheck
-          (MagmaNoTrans, MagmaNoTrans, d2, nrhs_batch+Nmax-Nsmall, d1,
-           scalar_t(-1.), F21, ld2, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
-           scalar_t(1.), d_bupd_batch[l], ld2, Nsmall,
-           L.max_d2_small, nrhs, L.max_d1_small, handle);
-      for (std::size_t i=Nsmall; i<N; i++) {
-        DenseMW_t fb(L.f[i]->dim_sep(), nrhs, h_rhs_batch[l][i], b.rows()),
-          fbu(L.f[i]->dim_upd(), nrhs, h_bupd_batch[l][i], L.f[i]->dim_upd());
-        if (nrhs == 1)
-          gpu::gemv(handle, Trans::N, scalar_t(-1.),
-                    L.f[i]->F21_, fb, scalar_t(1.), fbu);
-        else
-          gpu::gemm(handle, Trans::N, Trans::N, scalar_t(-1.),
-                    L.f[i]->F21_, fb, scalar_t(1.), fbu);
-      }
+    // F-GRAPH: with the rhs staged in the persistent pinned buffer, the whole device sequence (H2D, reorder,
+    // forward, backward, reorder back, D2H) has invariant arguments: capture it once per solve cache, replay it.
+    static const bool gsolve = graph_solve_on();
+    bool gcap = gsolve && (dp || rhs_pin);
+    // staging buffers (allocated outside any capture; their addresses are baked into the graph)
+    if (dp || rhs_pin) { if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems); }
+    if (dp) { if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems); }
+    scalar_t* hb = (dp || rhs_pin) ? static_cast<scalar_t*>(C.h_b) : nullptr;
+    scalar_t* d_braw = dp ? static_cast<scalar_t*>(C.d_braw) : nullptr;
+    if (dp) {
+      // S-HOST (magma-hpc, 2026-10-27): the right-hand side arrives RAW; stage it pinned, upload it and apply the
+      // sparse reordering on the device, d_b(i,:) = braw(iperm[i],:), instead of the host pass in transform_b.
+      const DenseM_t& br = *dp->braw;
+      if (br.ld() == br.rows()) std::copy(br.data(), br.data() + nb_elems, hb);
+      else for (int j=0; j<nrhs; j++) std::copy(br.ptr(0, j), br.ptr(0, j) + br.rows(), hb + std::size_t(j) * br.rows());
+    } else if (rhs_pin) {
+      if (b.ld() == b.rows()) std::copy(b.data(), b.data() + nb_elems, hb);
+      else for (int j=0; j<nrhs; j++) std::copy(b.ptr(0, j), b.ptr(0, j) + b.rows(), hb + std::size_t(j) * b.rows());
     }
-    if (solve_sync) gpu::synchronize_default_stream();
 
-
-    // backward solve
-    for (int l=0; l<lvls; l++) {
-      auto& L = ldata[l];
-      std::size_t N = L.f.size(), Nsmall = L.Nsmall;
-      auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
-      auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
-      auto F12 = L.dev_F_batch + Nsmall;
-      if (solve_sync) gpu::synchronize_default_stream();
-      if (l != 0) {
+    // the device part of the solve; on_stream: everything on comp_stream (capturable), else the original mix
+    auto issue_device = [&](bool on_stream) {
+      if (dp) {
+        gpu::copy_host_to_device_async<scalar_t>(d_braw, hb, nb_elems, C.comp_stream);
+        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_braw, d_b, dp->d_iperm);
+      } else if (rhs_pin)
+        gpu::copy_host_to_device_async<scalar_t>(d_b, hb, nb_elems, C.comp_stream);
+      else
+        gpu::copy_host_to_device<scalar_t>(d_b, b);
+      const bool sync = solve_sync && !on_stream;
+      // forward solve
+      for (int l=lvls-1; l>=0; l--) {
+        if (sync) gpu::synchronize_default_stream();
+        auto& L = ldata[l];
+        std::size_t N = L.f.size(), Nsmall = L.Nsmall;
+        // batch meta-data was uploaded once, see above (L.dev_*_batch)
+        auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
+        auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
+        auto F11 = L.dev_F_batch;   auto F21 = F11 + 2*Nsmall;
+        if (on_stream) {
+          gpu::memset_async<scalar_t>
+            ((l % 2) ? d_bupd_odd : d_bupd_even, 0, L.total_upd_size*nrhs, C.comp_stream);
+          if (l != lvls-1)
+            gpu::extend_add_rhs
+              (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l], C.comp_stream);
+        } else {
+          gpu::memset<scalar_t>
+            ((l % 2) ? d_bupd_odd : d_bupd_even, 0, L.total_upd_size*nrhs);
+          if (l != lvls-1)
+            gpu::extend_add_rhs
+              (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
+        }
+        // TODO remove?
+        if (sync) gpu::synchronize_default_stream();
+        if (!(C.perm_ready && Nsmall &&
+              gpu::permute_rows_fwd_vbatched<scalar_t>
+              (handle, nrhs_batch+Nmax-Nsmall, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
+               C.perm_batch[l], d1, L.max_d1_small, Nsmall)))
+          gpu::laswp_fwd_vbatched
+            (handle, nrhs_batch+Nmax-Nsmall, nrhs,
+             d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
+             L.dev_ipiv_batch, d1, Nsmall);
+        gpu::magma::trsm_vbatched_max_nocheck
+          (MagmaLeft, MagmaLower, MagmaNoTrans, MagmaUnit,
+           L.max_d1_small, nrhs, d1, nrhs_batch+Nmax-Nsmall, scalar_t(1.),
+           F11, ld1, d_rhs_batch[l], ldrhs_batch+Nmax-
+           Nsmall, Nsmall, handle);
+        gpu::magma::trsm_vbatched_max_nocheck
+          (MagmaLeft, MagmaUpper, MagmaNoTrans, MagmaNonUnit,
+           L.max_d1_small, nrhs, d1, nrhs_batch+Nmax-Nsmall, scalar_t(1.),
+           F11, ld1, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
+           Nsmall, handle);
+        for (std::size_t i=Nsmall; i<N; i++) {
+          DenseMW_t fb(L.f[i]->dim_sep(), nrhs, h_rhs_batch[l][i], b.rows());
+          gpu::getrs(handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_, fb, getrs_err);
+        }
+        if (l == 0) break;
         if (nrhs == 1)
           gpu::magma::gemv_vbatched_max_nocheck
-            (MagmaNoTrans, d1, d2, scalar_t(-1.), F12, ld1,
-             d_bupd_batch[l], inc_batch+Nmax-Nsmall, scalar_t(1.),
-             d_rhs_batch[l], inc_batch+Nmax-Nsmall, Nsmall,
-             L.max_d1_small, L.max_d2_small, handle);
+            (MagmaNoTrans, d2, d1, scalar_t(-1.),
+             F21, ld2, d_rhs_batch[l], inc_batch+Nmax-Nsmall, scalar_t(1.),
+             d_bupd_batch[l], inc_batch+Nmax-Nsmall, Nsmall,
+             L.max_d2_small, L.max_d1_small, handle);
         else
           gpu::magma::gemm_vbatched_max_nocheck
-            (MagmaNoTrans, MagmaNoTrans, d1, nrhs_batch+Nmax-Nsmall, d2,
-             scalar_t(-1.), F12, ld1, d_bupd_batch[l], ld2, scalar_t(1.),
-             d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall, Nsmall,
-             L.max_d1_small, nrhs, L.max_d2_small, handle);
+            (MagmaNoTrans, MagmaNoTrans, d2, nrhs_batch+Nmax-Nsmall, d1,
+             scalar_t(-1.), F21, ld2, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
+             scalar_t(1.), d_bupd_batch[l], ld2, Nsmall,
+             L.max_d2_small, nrhs, L.max_d1_small, handle);
         for (std::size_t i=Nsmall; i<N; i++) {
           DenseMW_t fb(L.f[i]->dim_sep(), nrhs, h_rhs_batch[l][i], b.rows()),
             fbu(L.f[i]->dim_upd(), nrhs, h_bupd_batch[l][i], L.f[i]->dim_upd());
           if (nrhs == 1)
             gpu::gemv(handle, Trans::N, scalar_t(-1.),
-                      L.f[i]->F12_, fbu, scalar_t(1.), fb);
+                      L.f[i]->F21_, fb, scalar_t(1.), fbu);
           else
             gpu::gemm(handle, Trans::N, Trans::N, scalar_t(-1.),
-                      L.f[i]->F12_, fbu, scalar_t(1.), fb);
+                      L.f[i]->F21_, fb, scalar_t(1.), fbu);
         }
       }
-      if (solve_sync) gpu::synchronize_default_stream();
-      if (l != lvls-1)
-        gpu::extract_rhs
-          (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
-    }
-    if (dp) {
-      // S-HOST: undo the reordering on the device, x(i,:) = y(perm[i],:), then download (replaces transform_x)
-      scalar_t* hb = C.h_b;
-      scalar_t* d_braw = C.d_braw;
-      gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, d_braw, dp->d_perm);
-      gpu::copy_device_to_host_async<scalar_t>(hb, d_braw, nb_elems, C.comp_stream);
+      if (sync) gpu::synchronize_default_stream();
+
+      // backward solve
+      for (int l=0; l<lvls; l++) {
+        auto& L = ldata[l];
+        std::size_t N = L.f.size(), Nsmall = L.Nsmall;
+        auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
+        auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
+        auto F12 = L.dev_F_batch + Nsmall;
+        if (sync) gpu::synchronize_default_stream();
+        if (l != 0) {
+          if (nrhs == 1)
+            gpu::magma::gemv_vbatched_max_nocheck
+              (MagmaNoTrans, d1, d2, scalar_t(-1.), F12, ld1,
+               d_bupd_batch[l], inc_batch+Nmax-Nsmall, scalar_t(1.),
+               d_rhs_batch[l], inc_batch+Nmax-Nsmall, Nsmall,
+               L.max_d1_small, L.max_d2_small, handle);
+          else
+            gpu::magma::gemm_vbatched_max_nocheck
+              (MagmaNoTrans, MagmaNoTrans, d1, nrhs_batch+Nmax-Nsmall, d2,
+               scalar_t(-1.), F12, ld1, d_bupd_batch[l], ld2, scalar_t(1.),
+               d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall, Nsmall,
+               L.max_d1_small, nrhs, L.max_d2_small, handle);
+          for (std::size_t i=Nsmall; i<N; i++) {
+            DenseMW_t fb(L.f[i]->dim_sep(), nrhs, h_rhs_batch[l][i], b.rows()),
+              fbu(L.f[i]->dim_upd(), nrhs, h_bupd_batch[l][i], L.f[i]->dim_upd());
+            if (nrhs == 1)
+              gpu::gemv(handle, Trans::N, scalar_t(-1.),
+                        L.f[i]->F12_, fbu, scalar_t(1.), fb);
+            else
+              gpu::gemm(handle, Trans::N, Trans::N, scalar_t(-1.),
+                        L.f[i]->F12_, fbu, scalar_t(1.), fb);
+          }
+        }
+        if (sync) gpu::synchronize_default_stream();
+        if (l != lvls-1) {
+          if (on_stream)
+            gpu::extract_rhs
+              (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l], C.comp_stream);
+          else
+            gpu::extract_rhs
+              (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
+        }
+      }
+      if (dp) {
+        // S-HOST: undo the reordering on the device, x(i,:) = y(perm[i],:), then download (replaces transform_x)
+        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, d_braw, dp->d_perm);
+        gpu::copy_device_to_host_async<scalar_t>(hb, d_braw, nb_elems, C.comp_stream);
+      } else if (rhs_pin)
+        gpu::copy_device_to_host_async<scalar_t>(hb, d_b, nb_elems, C.comp_stream);
+      else {
+        gpu::synchronize_default_stream();
+        gpu::copy_device_to_host<scalar_t>(b, d_b);
+      }
+    };
+
+#if defined(STRUMPACK_USE_CUDA)
+    if (gcap) {
+      const void* key[5] = { dp ? static_cast<const void*>(dp) : nullptr, dp ? dp->d_iperm : nullptr,
+                             dp ? dp->d_perm : nullptr, hb, d_braw };
+      key[0] = dp ? reinterpret_cast<const void*>(1) : nullptr;
+      if (C.graph.valid() && std::memcmp(key, C.gkey, sizeof(key)) != 0) C.graph.reset();
+      if (C.graph.valid()) graph_launch(C.graph, C.comp_stream);
+      else {
+        bool captured = graph_begin(C.comp_stream);
+        if (captured) {
+          issue_device(true);
+          captured = graph_end(C.comp_stream, C.graph, "solve");
+        }
+        if (captured) {
+          std::memcpy(C.gkey, key, sizeof(key));
+          graph_launch(C.graph, C.comp_stream);
+        } else
+          issue_device(false);
+      }
+    } else
+#endif
+      issue_device(false);
+    if (dp || rhs_pin) {
       C.comp_stream.synchronize();
       if (b.ld() == b.rows()) std::copy(hb, hb + nb_elems, b.data());
       else for (int j=0; j<nrhs; j++) std::copy(hb + std::size_t(j) * b.rows(), hb + std::size_t(j+1) * b.rows(), b.ptr(0, j));
-    } else if (rhs_pin) {
-      scalar_t* hb = C.h_b;
-      gpu::copy_device_to_host_async<scalar_t>(hb, d_b, nb_elems, C.comp_stream);
-      C.comp_stream.synchronize();
-      if (b.ld() == b.rows()) std::copy(hb, hb + nb_elems, b.data());
-      else for (int j=0; j<nrhs; j++) std::copy(hb + std::size_t(j) * b.rows(), hb + std::size_t(j+1) * b.rows(), b.ptr(0, j));
-    } else {
-      gpu::synchronize_default_stream();
-      gpu::copy_device_to_host<scalar_t>(b, d_b);
     }
     static const bool l2log = launch2_env("STRUM_LAUNCH2_LOG");
     static const bool l2ver = launch2_env("STRUM_LAUNCH2_VERIFY");

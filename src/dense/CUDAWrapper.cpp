@@ -346,6 +346,10 @@ namespace strumpack {
     void device_memset(void* dptr, int value, std::size_t count) {
       gpu_check(cudaMemset(dptr, value, count));
     }
+    void device_memset_async(void* dptr, int value, std::size_t count,
+                             Stream& s) {
+      gpu_check(cudaMemsetAsync(dptr, value, count, get_cuda_stream(s)));
+    }
 
     void device_copy(void* dest, const void* src,
                      std::size_t count, CopyDir dir) {

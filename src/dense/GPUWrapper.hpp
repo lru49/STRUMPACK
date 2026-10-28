@@ -205,6 +205,13 @@ namespace strumpack {
     void memset(void* dptr, int value, std::size_t count) {
       device_memset(dptr, value, sizeof(T)*count);
     }
+    // F-GRAPH: stream-ordered memset (capturable in a CUDA graph)
+    void device_memset_async(void* dptr, int value, std::size_t count,
+                             Stream& s);
+    template<typename T>
+    void memset_async(void* dptr, int value, std::size_t count, Stream& s) {
+      device_memset_async(dptr, value, sizeof(T)*count, s);
+    }
 
     enum class CopyDir { H2H, H2D, D2H, D2D, DEF };
 

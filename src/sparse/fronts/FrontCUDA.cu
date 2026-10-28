@@ -148,8 +148,8 @@ namespace strumpack {
     }
 
     template<typename T> void
-    assemble(unsigned int nf, AssembleData<T>* dat,
-             AssembleData<T>* ddat) {
+    assemble_impl(unsigned int nf, AssembleData<T>* dat,
+                  AssembleData<T>* ddat, cudaStream_t st) {
       { // front assembly from sparse matrix
         std::size_t nnz = 0;
         for (unsigned int f=0; f<nf; f++)
@@ -168,7 +168,7 @@ namespace strumpack {
           dim3 block(nt, ops);
           for (unsigned int f=0; f<nbf; f+=MAX_BLOCKS_Y) {
             dim3 grid(nb, std::min(nbf-f, MAX_BLOCKS_Y));
-            assemble_kernel<T,unroll><<<grid,block>>>(nf-f*ops, ddat+f*ops);
+            assemble_kernel<T,unroll><<<grid,block,0,st>>>(nf-f*ops, ddat+f*ops);
           }
         }
       }
@@ -195,15 +195,24 @@ namespace strumpack {
             unsigned int ny = std::min(nby-y, MAX_BLOCKS_Y);
             for (unsigned int f=0; f<nbf; f+=MAX_BLOCKS_Z) {
               dim3 grid(nbx, ny, std::min(nbf-f, MAX_BLOCKS_Z));
-              extend_add_kernel<T_,unroll><<<grid, block>>>
+              extend_add_kernel<T_,unroll><<<grid, block, 0, st>>>
                 (y, nf-f*ops, dat_+f*ops, true);
-              extend_add_kernel<T_,unroll><<<grid, block>>>
+              extend_add_kernel<T_,unroll><<<grid, block, 0, st>>>
                 (y, nf-f*ops, dat_+f*ops, false);
             }
           }
         }
       }
       gpu_check(cudaPeekAtLastError());
+    }
+    template<typename T> void
+    assemble(unsigned int nf, AssembleData<T>* dat, AssembleData<T>* ddat) {
+      assemble_impl(nf, dat, ddat, (cudaStream_t)0);
+    }
+    template<typename T> void
+    assemble(unsigned int nf, AssembleData<T>* dat, AssembleData<T>* ddat,
+             Stream& s) {
+      assemble_impl(nf, dat, ddat, get_cuda_stream(s));
     }
 
 
@@ -548,8 +557,9 @@ namespace strumpack {
     }
 
     template<typename T> void
-    extend_add_rhs(int N, int nrhs, unsigned int nf,
-                   AssembleData<T>* dat, AssembleData<T>* ddat) {
+    extend_add_rhs_impl(int N, int nrhs, unsigned int nf,
+                        AssembleData<T>* dat, AssembleData<T>* ddat,
+                        cudaStream_t st) {
       int du = 0;
       for (unsigned int f=0; f<nf; f++)
         du = std::max(du, std::max(dat[f].dCB1, dat[f].dCB2));
@@ -566,12 +576,22 @@ namespace strumpack {
       auto dat_ = reinterpret_cast<AssembleData<T_>*>(ddat);
       for (unsigned int f=0; f<nbf; f+=MAX_BLOCKS_Z) {
         dim3 grid(nb, std::min(nbf-f, MAX_BLOCKS_Z));
-        extend_add_rhs_kernel_left<<<grid, block>>>
+        extend_add_rhs_kernel_left<<<grid, block, 0, st>>>
           (N, nrhs, nf-f*ops, dat_+f*ops);
-        extend_add_rhs_kernel_right<<<grid, block>>>
+        extend_add_rhs_kernel_right<<<grid, block, 0, st>>>
           (N, nrhs, nf-f*ops, dat_+f*ops);
       }
       gpu_check(cudaPeekAtLastError());
+    }
+    template<typename T> void
+    extend_add_rhs(int N, int nrhs, unsigned int nf,
+                   AssembleData<T>* dat, AssembleData<T>* ddat) {
+      extend_add_rhs_impl(N, nrhs, nf, dat, ddat, (cudaStream_t)0);
+    }
+    template<typename T> void
+    extend_add_rhs(int N, int nrhs, unsigned int nf,
+                   AssembleData<T>* dat, AssembleData<T>* ddat, Stream& s) {
+      extend_add_rhs_impl(N, nrhs, nf, dat, ddat, get_cuda_stream(s));
     }
 
 
@@ -606,8 +626,8 @@ namespace strumpack {
     }
 
     template<typename T> void
-    extract_rhs(int N, int nrhs, unsigned int nf, AssembleData<T>* dat,
-                AssembleData<T>* ddat) {
+    extract_rhs_impl(int N, int nrhs, unsigned int nf, AssembleData<T>* dat,
+                     AssembleData<T>* ddat, cudaStream_t st) {
       int du = 0;
       for (unsigned int f=0; f<nf; f++)
         du = std::max(du, std::max(dat[f].dCB1, dat[f].dCB2));
@@ -624,9 +644,19 @@ namespace strumpack {
       auto dat_ = reinterpret_cast<AssembleData<T_>*>(ddat);
       for (unsigned int f=0; f<nbf; f+=MAX_BLOCKS_Z) {
         dim3 grid(nb, std::min(nbf-f, MAX_BLOCKS_Z));
-        extract_rhs_kernel<<<grid, block>>>
+        extract_rhs_kernel<<<grid, block, 0, st>>>
           (N, nrhs, nf-f*ops, dat_+f*ops);
       }
+    }
+    template<typename T> void
+    extract_rhs(int N, int nrhs, unsigned int nf, AssembleData<T>* dat,
+                AssembleData<T>* ddat) {
+      extract_rhs_impl(N, nrhs, nf, dat, ddat, (cudaStream_t)0);
+    }
+    template<typename T> void
+    extract_rhs(int N, int nrhs, unsigned int nf, AssembleData<T>* dat,
+                AssembleData<T>* ddat, Stream& s) {
+      extract_rhs_impl(N, nrhs, nf, dat, ddat, get_cuda_stream(s));
     }
 
 
@@ -646,19 +676,29 @@ namespace strumpack {
     }
 
     template<typename T> void
-    gather_front_elements(std::size_t n, const int* src, const unsigned* dst,
-                          const T* vals, T* base) {
+    gather_front_elements_impl(std::size_t n, const int* src, const unsigned* dst,
+                               const T* vals, T* base, cudaStream_t st) {
       if (!n) return;
       using T_ = typename cuda_type<T>::value_type;
       const unsigned nt = 256;
       const std::size_t nb = (n + nt - 1) / nt;
       for (std::size_t b0=0; b0<nb; b0+=65535) {
         const std::size_t bl = std::min<std::size_t>(65535, nb-b0);
-        gather_front_elements_kernel<T_><<<bl, nt>>>
+        gather_front_elements_kernel<T_><<<bl, nt, 0, st>>>
           (std::min(n - b0*nt, bl*nt), src + b0*nt, dst + b0*nt,
            reinterpret_cast<const T_*>(vals), reinterpret_cast<T_*>(base));
       }
       gpu_check(cudaPeekAtLastError());
+    }
+    template<typename T> void
+    gather_front_elements(std::size_t n, const int* src, const unsigned* dst,
+                          const T* vals, T* base) {
+      gather_front_elements_impl(n, src, dst, vals, base, (cudaStream_t)0);
+    }
+    template<typename T> void
+    gather_front_elements(std::size_t n, const int* src, const unsigned* dst,
+                          const T* vals, T* base, Stream& s) {
+      gather_front_elements_impl(n, src, dst, vals, base, get_cuda_stream(s));
     }
 
     // explicit template instantiations
@@ -680,6 +720,24 @@ namespace strumpack {
     template void extract_rhs(int, int, unsigned int, AssembleData<double>*, AssembleData<double>*);
     template void extract_rhs(int, int, unsigned int, AssembleData<std::complex<float>>*, AssembleData<std::complex<float>>*);
     template void extract_rhs(int, int, unsigned int, AssembleData<std::complex<double>>*, AssembleData<std::complex<double>>*);
+
+    // F-GRAPH stream overloads
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const float*, float*, Stream&);
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const double*, double*, Stream&);
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const std::complex<float>*, std::complex<float>*, Stream&);
+    template void gather_front_elements(std::size_t, const int*, const unsigned*, const std::complex<double>*, std::complex<double>*, Stream&);
+    template void assemble(unsigned int, AssembleData<float>*, AssembleData<float>*, Stream&);
+    template void assemble(unsigned int, AssembleData<double>*, AssembleData<double>*, Stream&);
+    template void assemble(unsigned int, AssembleData<std::complex<float>>*, AssembleData<std::complex<float>>*, Stream&);
+    template void assemble(unsigned int, AssembleData<std::complex<double>>*, AssembleData<std::complex<double>>*, Stream&);
+    template void extend_add_rhs(int, int, unsigned int, AssembleData<float>*, AssembleData<float>*, Stream&);
+    template void extend_add_rhs(int, int, unsigned int, AssembleData<double>*, AssembleData<double>*, Stream&);
+    template void extend_add_rhs(int, int, unsigned int, AssembleData<std::complex<float>>*, AssembleData<std::complex<float>>*, Stream&);
+    template void extend_add_rhs(int, int, unsigned int, AssembleData<std::complex<double>>*, AssembleData<std::complex<double>>*, Stream&);
+    template void extract_rhs(int, int, unsigned int, AssembleData<float>*, AssembleData<float>*, Stream&);
+    template void extract_rhs(int, int, unsigned int, AssembleData<double>*, AssembleData<double>*, Stream&);
+    template void extract_rhs(int, int, unsigned int, AssembleData<std::complex<float>>*, AssembleData<std::complex<float>>*, Stream&);
+    template void extract_rhs(int, int, unsigned int, AssembleData<std::complex<double>>*, AssembleData<std::complex<double>>*, Stream&);
 
 
     template void factor_block_batch<float,8,float>(unsigned int, FrontData<float>*, bool, float, int*);

@@ -71,6 +71,21 @@ namespace strumpack {
     template<typename T> void
     extract_rhs(int, int, unsigned int, AssembleData<T>*, AssembleData<T>*);
 
+    // F-GRAPH (magma-hpc F track): the same kernels issued on an explicit
+    // stream instead of the legacy default stream, so that a whole
+    // factorization level / solve can be captured in a CUDA graph.
+    template<typename T> void
+    gather_front_elements(std::size_t n, const int* src, const unsigned* dst,
+                          const T* vals, T* base, Stream& s);
+    template<typename T> void
+    assemble(unsigned int, AssembleData<T>*, AssembleData<T>*, Stream& s);
+    template<typename T> void
+    extend_add_rhs(int, int, unsigned int, AssembleData<T>*, AssembleData<T>*,
+                   Stream& s);
+    template<typename T> void
+    extract_rhs(int, int, unsigned int, AssembleData<T>*, AssembleData<T>*,
+                Stream& s);
+
   } // end namespace gpu
 } // end namespace strumpack
 
