@@ -284,10 +284,19 @@ namespace strumpack {
   };
 
 
+  // S-INVDIAG (window 121): the solve interleaves its stream with legacy-default-stream work (per-level memset,
+  // extend-add, extract); when the two map to different hardware queues every launch of the solve pays ~0.8 us
+  // more (nsys: 1.5 vs 0.7 us between queued kernels, +0.2 ms per solve), and whether they share a queue is
+  // round-robin luck at stream creation (per-epoch streams: jitter; S-CACHE-KEEP's kept stream: fixed for the run).
+  // Default: the solve runs entirely on the legacy default stream (one queue). STRUM_SOLVE_LEGACY_STREAM=0 = own stream.
+  static bool solve_legacy_stream() {
+    static const bool v = !(std::getenv("STRUM_SOLVE_LEGACY_STREAM") && std::atoi(std::getenv("STRUM_SOLVE_LEGACY_STREAM")) == 0);
+    return v;
+  }
   template<typename scalar_t,typename integer_t>
   struct FrontMAGMA<scalar_t,integer_t>::SolveCache {
     SolveCache(int nrhs, std::size_t rows)
-      : handle(comp_stream), nrhs(nrhs), rows(rows) {}
+      : comp_stream(solve_legacy_stream() ? 2 : 0), handle(comp_stream), nrhs(nrhs), rows(rows) {}
     gpu::Stream comp_stream;
     gpu::Handle handle;
     int nrhs;
@@ -357,6 +366,7 @@ namespace strumpack {
     inline bool use_U() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_U", 1) != 0; return v; }
     inline int verbose() { static const int v = env_int("STRUM_INVDIAG_VERBOSE", 0); return v; }
     inline bool own_stream() { static const bool v = env_int("STRUM_INVDIAG_STREAM", 1) != 0; return v; }   // v2: inversion on a second stream
+    inline bool nonblocking() { static const bool v = env_int("STRUM_INVDIAG_NONBLOCKING", 1) != 0; return v; }   // 0 = blocking: legacy-stream ops wait for it (overlap 93 % -> 31 %, window-121 probe)
     inline bool fused() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_FUSED", 1) != 0; return v; }      // v2: one kernel per step
     inline int chunk() { static const int v = std::max(16, env_int("STRUM_SOLVE_INVDIAG_CHUNK", 64)); return v; }
     inline bool nvtx() { static const bool v = env_int("STRUM_SOLVE_NVTX", 0) != 0; return v; }
@@ -589,7 +599,7 @@ namespace strumpack {
     std::vector<std::unique_ptr<gpu::Event>> inv_ready, inv_done;
     std::vector<cudaEvent_t> inv_t0, inv_t1;   // verbose timing per level (on the inversion stream)
     std::vector<float> inv_level_ms;
-    FactorCache() : inv_stream(true), inv_handle(inv_stream) {}
+    FactorCache() : inv_stream(invdiag::nonblocking()), inv_handle(inv_stream) {}
     ~FactorCache() { for (auto e : inv_t0) if (e) cudaEventDestroy(e); for (auto e : inv_t1) if (e) cudaEventDestroy(e); }
     double inv_ms = 0.;                         // inversion time of the last factorization (verbose)
     double inv_resid = 0.;                      // max ||I - inv * block|| of the last factorization (verbose >= 2)
