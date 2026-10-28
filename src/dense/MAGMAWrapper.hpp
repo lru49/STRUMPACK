@@ -234,6 +234,38 @@ namespace strumpack {
                                 magma_int_t batchCount, magma_int_t max_m, magma_int_t max_n,
                                 Handle& queue);
 
+
+      // S-INVDIAG: inverses of the 128x128 diagonal blocks (MAGMA layout: block j at dinvA + j*128*128, ld 128)
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               float const* const* dA_array, magma_int_t* ldda, float** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h);
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          float const* const* dA_array, magma_int_t* ldda, float** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h);
+
+      // S-INVDIAG: inverses of the 128x128 diagonal blocks (MAGMA layout: block j at dinvA + j*128*128, ld 128)
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               double const* const* dA_array, magma_int_t* ldda, double** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h);
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          double const* const* dA_array, magma_int_t* ldda, double** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h);
+
+      // S-INVDIAG: inverses of the 128x128 diagonal blocks (MAGMA layout: block j at dinvA + j*128*128, ld 128)
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               std::complex<float> const* const* dA_array, magma_int_t* ldda, std::complex<float>** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h);
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          std::complex<float> const* const* dA_array, magma_int_t* ldda, std::complex<float>** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h);
+
+      // S-INVDIAG: inverses of the 128x128 diagonal blocks (MAGMA layout: block j at dinvA + j*128*128, ld 128)
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               std::complex<double> const* const* dA_array, magma_int_t* ldda, std::complex<double>** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h);
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          std::complex<double> const* const* dA_array, magma_int_t* ldda, std::complex<double>** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h);
     } // end namespace magma
   } // end namespace gpu
 } // end namespace strumpack
