@@ -23,8 +23,11 @@
  * Knobs: STRUM_DEVUPDATE=0 restores the host update (default 1);
  * STRUM_DEVUPDATE_CHUNKS (8); STRUM_DEVUPDATE_PIN=0 never registers the
  * caller's array (staged copy through a pinned buffer, default 1);
- * STRUM_DEVUPDATE_WRITEBACK=0 leaves the host values stale (direct
- * solves only, default 1); STRUM_DEVUPDATE_VERBOSE=1 prints the times.
+ * STRUM_DEVUPDATE_WRITEBACK unset = lazy write-back (the host values are
+ * refreshed only when a host consumer reads them: Krylov / refinement,
+ * reorder, pivot growth; never in the direct-solve flow), 1 = eager
+ * (D2H right after the factorization is issued), 0 = never;
+ * STRUM_DEVUPDATE_VERBOSE=1 prints the times.
  *
  * Contract: the value array passed to update_matrix_values must stay
  * allocated and unmodified until the next factor() (the upload may still

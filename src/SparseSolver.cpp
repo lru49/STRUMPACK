@@ -72,6 +72,13 @@ namespace strumpack {
   }
 
   template<typename scalar_t,typename integer_t> void
+  SparseSolver<scalar_t,integer_t>::sync_host_matrix_values() {
+#if defined(STRUMPACK_USE_CUDA)
+    if (devupd_) devupd_->sync_host_values();
+#endif
+  }
+
+  template<typename scalar_t,typename integer_t> void
   SparseSolver<scalar_t,integer_t>::device_update_invalidate() {
 #if defined(STRUMPACK_USE_CUDA)
     if (devupd_) devupd_->invalidate();
@@ -166,10 +173,10 @@ namespace strumpack {
   (integer_t N, const integer_t* ptr, const integer_t* ind) {
     if (!upd_valid_ || !reordered_ || N != upd_N_ ||
         ptr[N] != upd_ptr_[N]) return false;
-    // structure check (STRUM_UPDATE_CHECK=0 skips the ind compare, 227 MB for the JOREK proxy, and
-    // trusts the caller's same-sparsity promise as upstream STRUMPACK does)
-    static const bool full_check = !(std::getenv("STRUM_UPDATE_CHECK") &&
-                                     std::atoi(std::getenv("STRUM_UPDATE_CHECK")) == 0);
+    // structure check: N, nnz and the row pointer always; the 227 MB ind compare only with STRUM_UPDATE_CHECK=1
+    // (default off: the caller's same-sparsity promise is trusted, as upstream STRUMPACK does)
+    static const bool full_check = std::getenv("STRUM_UPDATE_CHECK") &&
+      std::atoi(std::getenv("STRUM_UPDATE_CHECK")) != 0;   // default OFF (window 114: 21 ms per update)
     bool same = std::equal(upd_ptr_.begin(), upd_ptr_.end(), ptr);
     if (same && full_check) {
       const std::size_t nnz_in = upd_ind_.size();
@@ -279,6 +286,7 @@ namespace strumpack {
 
   template<typename scalar_t,typename integer_t> void
   SparseSolver<scalar_t,integer_t>::permute_matrix_values() {
+    sync_host_matrix_values();   // F-DEVUPDATE: the host values are read / moved below
     if (reordered_) {
       matrix()->apply_matching(matching_);
       matrix()->equilibrate(equil_);
@@ -399,10 +407,8 @@ namespace strumpack {
       // should still continue!!
       if (ierr != ReturnCode::SUCCESS) return ierr;
     }
-#if defined(STRUMPACK_USE_CUDA)
-    // F-DEVUPDATE: the Krylov solvers / iterative refinement read the matrix values on the host
-    if (devupd_ && opts_.Krylov_solver() != KrylovSolver::DIRECT) devupd_->sync_host_values();
-#endif
+    // F-DEVUPDATE: every branch but DIRECT reads the matrix values on the host (spmv / refinement)
+    if (opts_.Krylov_solver() != KrylovSolver::DIRECT) sync_host_matrix_values();
 
     TaskTimer t("solve");
     this->perf_counters_start();

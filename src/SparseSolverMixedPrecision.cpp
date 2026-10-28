@@ -233,7 +233,7 @@ namespace strumpack {
     // solver gather+cast the new values through its update cache; otherwise the original full path.
     static const bool fast = !(std::getenv("STRUM_MP_UPDATE") && std::atoi(std::getenv("STRUM_MP_UPDATE")) == 0);
     static const bool alias = !(std::getenv("STRUM_MP_ALIAS") && std::atoi(std::getenv("STRUM_MP_ALIAS")) == 0);
-    static const bool full_check = !(std::getenv("STRUM_UPDATE_CHECK") && std::atoi(std::getenv("STRUM_UPDATE_CHECK")) == 0);
+    static const bool full_check = std::getenv("STRUM_UPDATE_CHECK") && std::atoi(std::getenv("STRUM_UPDATE_CHECK")) != 0;   // default OFF
     bool same = fast && mat_.size() == A.size() && mat_.nnz() == A.nnz() &&
       std::equal(A.ptr(), A.ptr()+A.size()+1, mat_.ptr());
     if (same && full_check) {   // parallel compare of the 2 x nnz column indices (mat_ keeps the structure even when aliased)

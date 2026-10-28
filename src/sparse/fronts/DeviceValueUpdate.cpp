@@ -75,12 +75,15 @@ namespace strumpack {
       std::function<void(bool)> redo;           // re-enqueue of the last update (repair path)
       unsigned long long gen = 0;
       bool map_ok = false, current = false, wb_pending = false, copied_once = false;
+      bool host_stale = false, never_warned = false;   // host_vals lag behind d_out
       bool pinned_last = false, staged_warned = false;
       std::chrono::steady_clock::time_point t_update;
       double host_ms = 0.;
       const int nchunks = std::max(1, env_int("STRUM_DEVUPDATE_CHUNKS", 8));
       const bool pin = env_int("STRUM_DEVUPDATE_PIN", 1) != 0;
-      const bool writeback = env_int("STRUM_DEVUPDATE_WRITEBACK", 1) != 0;
+      // STRUM_DEVUPDATE_WRITEBACK: unset = LAZY (the host values are refreshed only when a host consumer asks,
+      // never in the direct-solve flow), 1 = eager (D2H right after the factorization is issued), 0 = never
+      const int writeback = env_int("STRUM_DEVUPDATE_WRITEBACK", 2);
       const bool verbose = env_int("STRUM_DEVUPDATE_VERBOSE", 0) != 0;
 
       Impl() {
@@ -178,7 +181,7 @@ namespace strumpack {
       auto& I = *impl_;
       invalidate();
       if (!nnz || !nnz_in || !host_vals) return false;
-      if (I.writeback && !I.reg_host.ensure(host_vals, nnz*sizeof(scalar_t))) {
+      if (I.writeback != 0 && !I.reg_host.ensure(host_vals, nnz*sizeof(scalar_t))) {
         if (I.verbose)
           std::cout << "# F-DEVUPDATE: cannot page-lock the matrix values for the write-back, host update" << std::endl;
         return false;
@@ -216,6 +219,7 @@ namespace strumpack {
       I.redo = [&I, raw](bool try_pin) { I.template enqueue<src_t>(raw, try_pin); };
       I.gen++;
       I.current = true;
+      I.host_stale = true;
       I.t_update = t0;
       I.host_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t0).count();
       return true;
@@ -229,13 +233,14 @@ namespace strumpack {
     template<typename scalar_t, typename integer_t> void
     DeviceValueUpdater<scalar_t,integer_t>::host_values_changed() {
       impl_->current = false;
+      impl_->host_stale = false;
     }
 
     template<typename scalar_t, typename integer_t> void
     DeviceValueUpdater<scalar_t,integer_t>::invalidate() {
       auto& I = *impl_;
       if (I.stream) gpu_check(cudaStreamSynchronize(I.stream));
-      I.map_ok = I.current = I.wb_pending = false;
+      I.map_ok = I.current = I.wb_pending = I.host_stale = false;
       I.reg_raw.unregister();
       I.reg_host.unregister();
       I.host_vals = nullptr; I.raw_ptr = nullptr; I.redo = nullptr;
@@ -282,9 +287,9 @@ namespace strumpack {
     template<typename scalar_t, typename integer_t> void
     DeviceValueUpdater<scalar_t,integer_t>::factor_enqueued() {
       auto& I = *impl_;
-      if (!I.writeback || !I.current || !I.host_vals) return;
-      // after the factorization work (legacy default stream order), refresh the host values; this overlaps the
-      // factorization kernels and is waited for only by host consumers of the values (sync_host_values)
+      if (I.writeback != 1 || !I.host_stale || !I.current || !I.host_vals) return;
+      // eager mode: after the factorization work (legacy default stream order), refresh the host values; this
+      // overlaps the factorization kernels and is waited for only by host consumers (sync_host_values)
       gpu_check(cudaEventRecord(I.e_order, 0));
       gpu_check(cudaStreamWaitEvent(I.stream, I.e_order, 0));
       gpu_check(cudaMemcpyAsync(I.host_vals, I.d_out.template as<scalar_t>(), I.nnz*sizeof(scalar_t),
@@ -296,10 +301,32 @@ namespace strumpack {
     template<typename scalar_t, typename integer_t> void
     DeviceValueUpdater<scalar_t,integer_t>::sync_host_values() {
       auto& I = *impl_;
-      if (I.wb_pending) {
+      if (I.wb_pending) {   // eager copy in flight
         gpu_check(cudaEventSynchronize(I.e_wb));
         I.wb_pending = false;
+        I.host_stale = false;
+        return;
       }
+      if (!I.host_stale || !I.current || !I.host_vals) return;
+      if (I.writeback == 0) {
+        if (!I.never_warned)
+          std::cerr << "# F-DEVUPDATE WARNING: a host consumer reads the matrix values but "
+            "STRUM_DEVUPDATE_WRITEBACK=0 forbids the write-back; the host values are stale" << std::endl;
+        I.never_warned = true;
+        return;
+      }
+      // lazy mode: copy the permuted values back now (after the gather and whatever was issued on the legacy stream)
+      const auto t0 = std::chrono::steady_clock::now();
+      gpu_check(cudaEventRecord(I.e_order, 0));
+      gpu_check(cudaStreamWaitEvent(I.stream, I.e_order, 0));
+      gpu_check(cudaMemcpyAsync(I.host_vals, I.d_out.template as<scalar_t>(), I.nnz*sizeof(scalar_t),
+                                cudaMemcpyDeviceToHost, I.stream));
+      gpu_check(cudaStreamSynchronize(I.stream));
+      I.host_stale = false;
+      if (I.verbose)
+        std::cout << "# F-DEVUPDATE lazy write-back of the host values: "
+                  << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t0).count()
+                  << " ms (" << I.nnz*sizeof(scalar_t)/1e6 << " MB)" << std::endl;
     }
 
 #define DEVUPD_INST(S, I)                                                \

@@ -265,12 +265,13 @@ namespace strumpack {
     // same, with the cast src_t -> scalar_t folded into the gather (host) or done in the device gather kernel
     template<typename src_t>
     bool update_values_cached_from(integer_t N, const integer_t* ptr, const integer_t* ind, const src_t* val);
-    // the cached map applies: same N / nnz / ptr / ind as when it was built (STRUM_UPDATE_CHECK=0 skips the ind compare)
+    // the cached map applies: same N / nnz / ptr as when it was built (ind too with STRUM_UPDATE_CHECK=1)
     bool update_cache_structure_ok(integer_t N, const integer_t* ptr, const integer_t* ind);
     // F-DEVUPDATE: the device-side update (sparse/fronts/DeviceValueUpdate.hpp); the matrix' host values are
     // then refreshed asynchronously and the factorization takes the values from the device
     void host_values_updated();   // host path wrote mat_->val(): the device copy is stale
     void device_update_invalidate();   // before mat_ is replaced
+    void sync_host_matrix_values() override;   // lazy write-back before a host read of the values
 #if defined(STRUMPACK_USE_CUDA)
     std::unique_ptr<gpu::DeviceValueUpdater<scalar_t,integer_t>> devupd_;
 #endif
