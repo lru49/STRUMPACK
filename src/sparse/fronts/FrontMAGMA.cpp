@@ -289,9 +289,12 @@ namespace strumpack {
   // extend-add, extract); when the two map to different hardware queues every launch of the solve pays ~0.8 us
   // more (nsys: 1.5 vs 0.7 us between queued kernels, +0.2 ms per solve), and whether they share a queue is
   // round-robin luck at stream creation (per-epoch streams: jitter; S-CACHE-KEEP's kept stream: fixed for the run).
-  // Default: the solve runs entirely on the legacy default stream (one queue). STRUM_SOLVE_LEGACY_STREAM=0 = own stream.
+  // With S-GEMVBATCH the solve loop issues everything on its own stream (the update-buffer memset included, see
+  // gpu_solve), so there is no cross-queue hand-off left and the own stream is the default again: launching into
+  // the legacy null stream costs ~2 us more host time per call (solve5 probe: +0.1 ms host wall, same GPU span).
+  // STRUM_SOLVE_LEGACY_STREAM=1 selects the legacy default stream.
   static bool solve_legacy_stream() {
-    static const bool v = !(std::getenv("STRUM_SOLVE_LEGACY_STREAM") && std::atoi(std::getenv("STRUM_SOLVE_LEGACY_STREAM")) == 0);
+    static const bool v = std::getenv("STRUM_SOLVE_LEGACY_STREAM") && std::atoi(std::getenv("STRUM_SOLVE_LEGACY_STREAM")) == 1;
     return v;
   }
   template<typename scalar_t,typename integer_t>
@@ -2287,10 +2290,10 @@ namespace strumpack {
     // restores them (A/B arm).
     static const bool solve_sync = std::getenv("STRUM_SOLVE_SYNC") && std::atoi(std::getenv("STRUM_SOLVE_SYNC")) == 1;
     // forward solve
-    // S-GEMVBATCH: all levels' update buffers at once. S2: stream-ordered on comp_stream (a synchronous cudaMemset
-    // runs on the legacy default stream, a barrier for every blocking stream: K concurrent solvers would serialise
-    // on it); same bytes, same ordering for the single-solver case.
-    if (C.gemvb_on) gpu_check(cudaMemsetAsync(d_bupd_odd, 0, C.bupd_elems * sizeof(scalar_t), gpu::get_cuda_stream(C.comp_stream)));
+    // S-GEMVBATCH: all levels' update buffers at once, on the solve's stream (no legacy-stream hand-off; S2: a
+    // legacy-stream memset is also a barrier across the K concurrent per-solver streams)
+    if (C.gemvb_on)
+      gpu_check(cudaMemsetAsync(d_bupd_odd, 0, C.bupd_elems * sizeof(scalar_t), gpu::get_cuda_stream(C.comp_stream)));
     for (int l=lvls-1; l>=0; l--) {
       if (solve_sync) gpu::synchronize_default_stream();
       std::string rname = "fwd l=" + std::to_string(l);
