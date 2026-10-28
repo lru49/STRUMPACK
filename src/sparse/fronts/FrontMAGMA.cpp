@@ -1052,6 +1052,10 @@ namespace strumpack {
     // reallocated source buffer) invalidates them
     if (gmode != 0 && vals != C.graph_vals) { C.graphs.clear(); C.graph_vals = vals; }
 #endif
+    // the first factorization of a cache runs eagerly (warm-up): kernels launched for the first time inside a
+    // capture (lazy module loading, first-use attributes) invalidated it for the levels whose kernels no earlier
+    // level had used; capture from the second factorization on, replay from the third
+    const bool may_capture = C.nfact >= 1;
     auto run_all = [&]() {
 #if defined(STRUMPACK_USE_CUDA)
     if (gmode == 2) {
@@ -1062,7 +1066,7 @@ namespace strumpack {
       for (int l=0; l<C.lvls; l++) all_capturable = all_capturable && level_capturable(l);
       if (G.valid()) graph_launch(G, comp_stream);
       else {
-        bool captured = all_capturable && graph_begin(comp_stream);
+        bool captured = may_capture && all_capturable && graph_begin(comp_stream);
         if (captured) {
           for (int l=C.lvls-1; l>=0; l--) run_level(l);
           captured = graph_end(comp_stream, G, "factorization");
@@ -1085,7 +1089,7 @@ namespace strumpack {
 #endif
           graph_launch(C.graphs[lg], comp_stream);
         } else {
-          bool captured = level_capturable(l) && graph_begin(comp_stream);
+          bool captured = may_capture && level_capturable(l) && graph_begin(comp_stream);
           if (captured) {
             run_level(l);
             captured = graph_end(comp_stream, G, (std::string("level ") + std::to_string(l)).c_str());
