@@ -1012,6 +1012,9 @@ namespace strumpack {
     cudaStream_t st = magma_queue_get_cuda_stream(gpu::get_magma_queue(handle));
     if (verbose) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, st); }
     gpu::memset<scalar_t>(V.d_inv, 0, 2 * V.side_elems);
+    // the intermediate layouts in the scratch must be zero too: the lacpy of a composed s-block copies its whole
+    // s x s square, including the quadrant that round never writes (NB = 512 read the previous level's data there)
+    if (V.scratch_elems) gpu::memset<scalar_t>(C.inv_scratch, 0, V.scratch_elems);
     for (int side=0; side<2; side++) {
       // MAGMA's trtri_diag_vbatched returns wrong blocks (checked standalone, stock 2.10.0 too): one nonbatched
       // call per front (~10 launches each, once per factorization)
