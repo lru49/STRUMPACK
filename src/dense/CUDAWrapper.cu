@@ -303,9 +303,10 @@ namespace strumpack {
     template void gather_rows(Handle&, int, int, const std::complex<float>*, std::complex<float>*, const int*);
     template void gather_rows(Handle&, int, int, const std::complex<double>*, std::complex<double>*, const int*);
 
-    // S-GEMVBATCH (magma-hpc, 2026-10-28), see GPUWrapper.hpp. Block (R rows, Lt lane-threads); the L = S x DIM_Y lanes
-    // of a row (column chunk s, interleave t) are processed Lt at a time in lane order and folded by the row's first
-    // thread exactly as MAGMA's gemvn_vbatched / G-GEMV1 split-K reduce fold them (bitwise). The x vector is staged
+    // S-GEMVBATCH (magma-hpc, 2026-10-28), see GPUWrapper.hpp. Block (R rows, G lane-threads): CTA = lane group g of a
+    // row block; the L = S x DIM_Y lanes of a row (column chunk s, interleave t) are computed by NG = ceil(L/G) CTAs
+    // (NG > 1: partials to a workspace, the last-arriving CTA of the row block folds them) and folded in lane order by
+    // the row's first thread exactly as MAGMA's gemvn_vbatched / G-GEMV1 split-K reduce fold them (bitwise). The x vector is staged
     // in shared memory (fwd: the front's solution block; bwd: gathered from the global solution with the update
     // indices). fwd epilogue: the last-arriving CTA of a parent front performs the parent's extend-add, left child
     // then right child (threadfence + counter; data writes have no races: a child's rows map to distinct parent rows).
@@ -313,46 +314,71 @@ namespace strumpack {
     gemvb_kernel(const GemvbArgs<T> P) {
       extern __shared__ __align__(16) char gemvb_smem[];
       T* xs = reinterpret_cast<T*>(gemvb_smem);
-      T* red = xs + P.nmax;                               // [Lt][R]
+      T* red = xs + P.nmax;                               // [G][R]
       __shared__ int s_last;
-      const int f = P.items[2*blockIdx.x], row0 = P.items[2*blockIdx.x+1];
-      const int m = P.m[f], n = P.n[f];
-      const std::size_t ld = P.ld[f];
-      const int R = blockDim.x, Lt = blockDim.y, tx = threadIdx.x, ty = threadIdx.y, nt = R*Lt, tid = tx + ty*R;
-      if (FWD) { const T* xsrc = P.x[f]; for (int j=tid; j<n; j+=nt) xs[j] = xsrc[j]; }
-      else { const int* u = P.upd[f]; const T* xg = P.xg; for (int j=tid; j<n; j+=nt) xs[j] = xg[u[j]]; }
+      const int* it = P.items + 4*blockIdx.x;
+      const int f = it[0], row0 = it[1], g = it[2], slot = it[3];
+      const int m = P.m[f], n = P.n[f], ld = P.ld[f];
+      const int R = blockDim.x, G = blockDim.y, tx = threadIdx.x, ty = threadIdx.y, nt = R*G, tid = tx + ty*R;
+      const int DY = P.DIM_Y, L = P.L, NG = P.NG, chunk = P.chunk;
+      // stage only the columns this lane group touches: lanes [g*G, g*G+G) = chunks [g*G/DY, (g*G+G-1)/DY]
+      const int c_lo = min(n, (g*G / DY) * chunk), c_hi = min(n, (min(L, g*G + G) - 1) / DY * chunk + chunk);
+      if (FWD) { const T* xsrc = P.x[f]; for (int j=c_lo+tid; j<c_hi; j+=nt) xs[j-c_lo] = xsrc[j]; }
+      else { const int* u = P.upd[f]; const T* xg = P.xg; for (int j=c_lo+tid; j<c_hi; j+=nt) xs[j-c_lo] = xg[u[j]]; }
       __syncthreads();
       const int row = row0 + tx;
       const bool act = row < m;
       const T* Ar = P.A[f] + (act ? row : 0);
-      const int DY = P.DIM_Y, L = P.L, chunk = P.chunk;
-      T res = T(0), cs = T(0);
-      for (int k = 0; k < L; k += Lt) {
-        const int lane = k + ty;
-        T p = T(0);
-        if (act && lane < L) {
-          const int s = lane / DY, t = lane - s*DY;
-          const int c0 = s*chunk, c1 = min(n, c0 + chunk);
-          int col = c0 + t;
-          for (; col + 3*DY < c1; col += 4*DY) {
-            const T a0 = __ldg(Ar + std::size_t(col)*ld), a1 = __ldg(Ar + std::size_t(col+DY)*ld),
-              a2 = __ldg(Ar + std::size_t(col+2*DY)*ld), a3 = __ldg(Ar + std::size_t(col+3*DY)*ld);
-            p = fma(a0, xs[col], p); p = fma(a1, xs[col+DY], p); p = fma(a2, xs[col+2*DY], p); p = fma(a3, xs[col+3*DY], p);
-          }
-          for (; col < c1; col += DY) p = fma(__ldg(Ar + std::size_t(col)*ld), xs[col], p);
+      const T* xl = xs - c_lo;
+      const int lane = g*G + ty;
+      T p = T(0);
+      if (act && lane < L) {
+        const int s = lane / DY, t = lane - s*DY;
+        const int c0 = s*chunk, c1 = min(n, c0 + chunk);
+        int col = c0 + t;
+        for (; col + 3*DY < c1; col += 4*DY) {
+          const T a0 = __ldg(Ar + col*ld), a1 = __ldg(Ar + (col+DY)*ld), a2 = __ldg(Ar + (col+2*DY)*ld), a3 = __ldg(Ar + (col+3*DY)*ld);
+          p = fma(a0, xl[col], p); p = fma(a1, xl[col+DY], p); p = fma(a2, xl[col+2*DY], p); p = fma(a3, xl[col+3*DY], p);
         }
+        for (; col < c1; col += DY) p = fma(__ldg(Ar + col*ld), xl[col], p);
+      }
+      // fold of the lanes in order: cs_s = ((p_{s,0} + p_{s,1}) + ...) as MAGMA's sdata[0] += sdata[j];
+      // res = cs_0 (one chunk) or 0 + cs_0 + cs_1 + ... (split-K reduce); chunks without columns are never summed
+      T res = T(0), cs = T(0);
+      auto fold = [&](int k, int kend) {
+        for (int q = 0; q < G && k + q < kend; q++) {
+          const int lq = k + q, s = lq / DY, t = lq - s*DY;
+          if (s*chunk >= n) break;
+          const T pq = red[q*R + tx];
+          cs = (t == 0) ? pq : cs + pq;
+          if (t == DY-1) res = P.split ? res + cs : cs;
+        }
+      };
+      if (NG == 1) {
         red[ty*R + tx] = p;
         __syncthreads();
-        if (ty == 0 && act) {
-          for (int q = 0; q < Lt && k + q < L; q++) {
-            const int lq = k + q, s = lq / DY, t = lq - s*DY;
-            if (s*chunk >= n) break;                      // chunk without columns: never written nor summed by MAGMA
-            const T pq = red[q*R + tx];
-            cs = (t == 0) ? pq : cs + pq;                 // sdata[0] += sdata[1], += sdata[2], ...
-            if (t == DY-1) res = P.split ? res + cs : cs; // split reduce: res = 0, res += partial_s in order
-          }
+        if (ty == 0 && act) fold(0, L);
+      } else {
+        T* wsp = P.ws + std::size_t(slot) * L * R;
+        if (lane < L) wsp[lane*R + tx] = p;
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+          const int old = atomicAdd(P.slot_counters + slot, 1);
+          const int last = (old == NG - 1);
+          if (last) P.slot_counters[slot] = 0;
+          s_last = last;
         }
         __syncthreads();
+        if (!s_last) return;
+        __threadfence();
+        for (int k = 0; k < L; k += G) {
+          const int ln = k + ty;
+          red[ty*R + tx] = (ln < L) ? __ldcg(wsp + ln*R + tx) : T(0);
+          __syncthreads();
+          if (ty == 0 && act) fold(k, L);
+          __syncthreads();
+        }
       }
       if (ty == 0 && act && n > 0) { T* y = P.y[f]; y[row] = y[row] - res; }   // alpha*res + beta*y, alpha = -1, beta = 1
       if (FWD) {
@@ -394,12 +420,12 @@ namespace strumpack {
       if (P.nitems <= 0) return true;
       cudaStream_t streamId;
       cublasGetStream(get_cublas_handle(handle), &streamId);
-      const std::size_t smem = (std::size_t(P.nmax) + std::size_t(P.Lt) * P.R) * sizeof(T);
+      const std::size_t smem = (std::size_t(P.nmax) + std::size_t(P.G) * P.R) * sizeof(T);
       if (smem > 48 * 1024) {
         static bool opted = false;
         if (!opted) { cudaFuncSetAttribute(gemvb_kernel<T,FWD>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); opted = true; }
       }
-      dim3 block(P.R, P.Lt);
+      dim3 block(P.R, P.G);
       gemvb_kernel<T,FWD><<<P.nitems, block, smem, streamId>>>(P);
       gpu_check(cudaPeekAtLastError());
       return true;

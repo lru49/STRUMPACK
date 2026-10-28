@@ -339,6 +339,7 @@ namespace strumpack {
     std::vector<gpu::GemvbArgs<scalar_t>> gemvb_f, gemvb_b;
     gpu::DeviceMemory<int> gemvb_ints;
     gpu::DeviceMemory<int*> gemvb_updp;
+    gpu::DeviceMemory<scalar_t> gemvb_ws;    // lane partials of the levels whose row blocks span several CTAs
   };
 
   // S-INVDIAG (magma-hpc, 2026-10-27): the top-of-tree fronts (d1 of several hundred to a few thousand rows) solve
@@ -422,12 +423,17 @@ namespace strumpack {
         }
       }
     }
-    // CTA shape: R rows x Lt lane-threads (R * Lt <= 1024)
-    inline void shape(int max_m, int L, int Renv, int& R, int& Lt) {
-      if (L <= 8) { R = 128; Lt = L; } else { R = 64; Lt = std::min(L, 16); }
+    // CTA shape: R rows x G lane-threads (R * G <= 1024), NG = ceil(L/G) lane groups per row block (even groups);
+    // R shrinks (down to 32) until the level has at least `min_items` CTAs. STRUM_SOLVE_GEMVB_R forces R.
+    inline int items_of(const std::vector<int>& rows, int R, int NG) { long c = 0; for (int m : rows) c += long((m + R - 1) / R) * NG; return int(c); }
+    inline void shape(const std::vector<int>& rows, int max_m, int L, int Renv, int& R, int& G, int& NG) {
+      G = std::min(L, 16); NG = (L + G - 1) / G; G = (L + NG - 1) / NG;
+      R = (G <= 8) ? 128 : 64;
       while (R > 32 && R / 2 >= max_m) R /= 2;
+      static const int min_items = env_int("STRUM_SOLVE_GEMVB_MIN_ITEMS", 400);
+      while (R > 64 && items_of(rows, R, NG) < min_items) R /= 2;
       if (Renv >= 32) R = Renv;
-      while (R * Lt > 1024 && Lt > 1) Lt /= 2;
+      while (R * G > 1024 && R > 32) R /= 2;
     }
   }
 
@@ -1959,11 +1965,11 @@ namespace strumpack {
           }
         const std::size_t off_counters = ints.size();   // fwd: per front, arrivals of its children's items (self-resetting)
         ints.insert(ints.end(), Ntotal + 1, 0);
-        std::vector<int> expected(Ntotal, 0);           // fwd: per front, number of items of its children
-        struct LevelOff { std::size_t items_f = 0, items_b = 0, parent = 0; };
+        std::vector<int> expected(Ntotal, 0);           // fwd: per front, number of row-block slots of its children
+        struct LevelOff { std::size_t items_f = 0, items_b = 0, parent = 0, slots_f = 0, slots_b = 0; };
         std::vector<LevelOff> lo(lvls);
         std::vector<gpu::GemvbArgs<scalar_t>> PF(lvls), PB(lvls);
-        std::size_t bytes_total = 0;
+        std::size_t bytes_total = 0, ws_max = 0;
         for (int l=lvls-1; l>=1; l--) {
           auto& L = ldata[l]; auto& Lp = ldata[l-1];
           const std::size_t N = L.f.size();
@@ -1973,49 +1979,65 @@ namespace strumpack {
           for (std::size_t i=0; i<Lp.f.size(); i++)
             for (auto ch : {Lp.f[i]->lchild_.get(), Lp.f[i]->rchild_.get()})
               if (ch) parent[idx.at(ch)] = int(i);
+          // items: 4 ints (front, first row, lane group, row-block slot); returns the number of slots
           auto plan = [&](bool fwd, gpu::GemvbArgs<scalar_t>& P, std::vector<int>& items) {
             const int max_m = fwd ? L.max_d2_small : L.max_d1_small, max_n = fwd ? L.max_d1_small : L.max_d2_small;
             int DY = 1, S = 1, chunk = max_n;
             gemvb::magma_gemvn_order(is_float, max_m, max_n, int(N), DY, S, chunk);
             P.DIM_Y = DY; P.chunk = chunk; P.split = S > 1 ? 1 : 0; P.L = S * DY; P.nmax = max_n;
-            gemvb::shape(max_m, P.L, Renv, P.R, P.Lt);
-            items.clear();
+            std::vector<int> rows;
             for (std::size_t i=0; i<N; i++) {
               const int m = fwd ? L.f[i]->dim_upd() : L.f[i]->dim_sep(), n = fwd ? L.f[i]->dim_sep() : L.f[i]->dim_upd();
-              if (m <= 0 || n <= 0) continue;   // MAGMA's gemv leaves y untouched for an empty shape
-              for (int r0=0; r0<m; r0+=P.R) { items.push_back(int(i)); items.push_back(r0); }
+              rows.push_back(m > 0 && n > 0 ? m : 0);   // MAGMA's gemv leaves y untouched for an empty shape
             }
-            P.nitems = int(items.size() / 2);
+            gemvb::shape(rows, max_m, P.L, Renv, P.R, P.G, P.NG);
+            items.clear();
+            int slot = 0;
+            for (std::size_t i=0; i<N; i++)
+              for (int r0=0; r0<rows[i]; r0+=P.R, slot++)
+                for (int g=0; g<P.NG; g++) { items.push_back(int(i)); items.push_back(r0); items.push_back(g); items.push_back(slot); }
+            P.nitems = int(items.size() / 4);
+            if (P.NG > 1) ws_max = std::max(ws_max, std::size_t(slot) * P.L * P.R);
+            return slot;
           };
           std::vector<int> itf, itb;
-          plan(true, PF[l], itf);
+          int nslots_f = plan(true, PF[l], itf);
 #if defined(STRUM_PLANT_GEMVB)
           if (l == std::min(10, lvls - 1)) {   // PLANT gemvb-skip-rowblock: the last row block of the level's largest front is skipped
             std::size_t big = 0;
             for (std::size_t i=1; i<N; i++) if (L.f[i]->dim_upd() > L.f[big]->dim_upd()) big = i;
-            for (std::size_t k=itf.size(); k>=2; k-=2) if (itf[k-2] == int(big)) { itf.erase(itf.begin()+k-2, itf.begin()+k); break; }
-            PF[l].nitems = int(itf.size() / 2);
-            std::cout << "# PLANT gemvb-skip-rowblock level " << l << " front " << big << " d2 " << L.f[big]->dim_upd() << std::endl;
+            int last_slot = -1;
+            for (std::size_t k=0; k<itf.size(); k+=4) if (itf[k] == int(big)) last_slot = itf[k+3];
+            std::vector<int> kept;
+            for (std::size_t k=0; k<itf.size(); k+=4) if (itf[k+3] != last_slot) kept.insert(kept.end(), itf.begin()+k, itf.begin()+k+4);
+            itf.swap(kept); PF[l].nitems = int(itf.size() / 4);
+            std::cout << "# PLANT gemvb-skip-rowblock level " << l << " front " << big << " d2 " << L.f[big]->dim_upd() << " slot " << last_slot << std::endl;
           }
 #endif
-          for (std::size_t k=0; k<itf.size(); k+=2) expected[l_off[l-1] + parent[itf[k]]]++;
-          plan(false, PB[l], itb);
+          {   // each row-block slot arrives once at its parent
+            int prev = -1;
+            for (std::size_t k=0; k<itf.size(); k+=4) if (itf[k+3] != prev) { prev = itf[k+3]; expected[l_off[l-1] + parent[itf[k]]]++; }
+          }
+          int nslots_b = plan(false, PB[l], itb);
           lo[l].items_f = push(itf); lo[l].items_b = push(itb); lo[l].parent = push(parent);
+          lo[l].slots_f = ints.size(); ints.insert(ints.end(), nslots_f + 1, 0);
+          lo[l].slots_b = ints.size(); ints.insert(ints.end(), nslots_b + 1, 0);
           if (gemvb::verbose()) {
             std::size_t bytes = 0;
             for (std::size_t i=0; i<N; i++) bytes += std::size_t(L.f[i]->dim_sep()) * L.f[i]->dim_upd() * sizeof(scalar_t);
             bytes_total += 2 * bytes;
             std::cout << "# GEMVB level " << l << " fronts " << N << " max_d1 " << L.max_d1_small << " max_d2 " << L.max_d2_small
                       << " panel_MB " << bytes / 1e6
-                      << " | fwd items " << PF[l].nitems << " R " << PF[l].R << " Lt " << PF[l].Lt << " L " << PF[l].L
-                      << " DIM_Y " << PF[l].DIM_Y << " chunk " << PF[l].chunk << " split " << PF[l].split
-                      << " | bwd items " << PB[l].nitems << " R " << PB[l].R << " Lt " << PB[l].Lt << " L " << PB[l].L
-                      << " DIM_Y " << PB[l].DIM_Y << " chunk " << PB[l].chunk << " split " << PB[l].split << std::endl;
+                      << " | fwd items " << PF[l].nitems << " slots " << nslots_f << " R " << PF[l].R << " G " << PF[l].G << " NG " << PF[l].NG
+                      << " L " << PF[l].L << " DIM_Y " << PF[l].DIM_Y << " chunk " << PF[l].chunk << " split " << PF[l].split
+                      << " | bwd items " << PB[l].nitems << " slots " << nslots_b << " R " << PB[l].R << " G " << PB[l].G << " NG " << PB[l].NG
+                      << " L " << PB[l].L << " DIM_Y " << PB[l].DIM_Y << " chunk " << PB[l].chunk << " split " << PB[l].split << std::endl;
           }
         }
         const std::size_t off_expected = push(expected);
         C.gemvb_ints = gpu::DeviceMemory<int>(ints.size());
         gpu::copy_host_to_device<int>(C.gemvb_ints, ints.data(), ints.size());
+        if (ws_max) C.gemvb_ws = gpu::DeviceMemory<scalar_t>(ws_max);
         int* di = C.gemvb_ints;
         std::vector<int*> updp(Ntotal);
         for (std::size_t k=0; k<Ntotal; k++) updp[k] = di + upd_off[k];
@@ -2027,13 +2049,15 @@ namespace strumpack {
           auto& F = PF[l]; auto& B = PB[l];
           F.items = di + lo[l].items_f; F.m = L.dev_d2_batch; F.n = L.dev_d1_batch; F.ld = L.dev_ld2_batch;
           F.A = L.dev_F_batch + 2*N; F.x = d_rhs_batch[l]; F.y = d_bupd_batch[l];
+          F.ws = C.gemvb_ws; F.slot_counters = di + lo[l].slots_f;
           F.parent = di + lo[l].parent; F.counters = di + off_counters + l_off[l-1]; F.expected = di + off_expected + l_off[l-1];
           F.pa = d_asmbl + l_off[l-1];
           B.items = di + lo[l].items_b; B.m = L.dev_d1_batch; B.n = L.dev_d2_batch; B.ld = L.dev_ld1_batch;
           B.A = L.dev_F_batch + N; B.y = d_rhs_batch[l]; B.upd = C.gemvb_updp.template as<int*>() + l_off[l]; B.xg = d_b;
+          B.ws = C.gemvb_ws; B.slot_counters = di + lo[l].slots_b;
         }
         C.gemvb_f = std::move(PF); C.gemvb_b = std::move(PB);
-        if (gemvb::verbose()) std::cout << "# GEMVB panels_total_MB " << bytes_total / 1e6 << " plan_ints " << ints.size() << std::endl;
+        if (gemvb::verbose()) std::cout << "# GEMVB panels_total_MB " << bytes_total / 1e6 << " plan_ints " << ints.size() << " ws_MB " << ws_max * sizeof(scalar_t) / 1e6 << std::endl;
       }
       // S-INVDIAG: per-step batch arrays of the block recurrence for the converted levels (nrhs == 1 only)
       C.inv.clear();
