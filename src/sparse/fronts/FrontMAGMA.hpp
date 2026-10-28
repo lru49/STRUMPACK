@@ -77,6 +77,12 @@ namespace strumpack {
     bool multifrontal_solve_devperm(const DenseM_t& b, DenseM_t& x,
                                     const std::vector<integer_t>& iperm,
                                     const std::vector<integer_t>& perm) const override;
+    // S2: device-pointer solve on the caller's stream (see Front::multifrontal_solve_device)
+    bool multifrontal_solve_device(const scalar_t* d_b, scalar_t* d_x,
+                                   std::size_t n, int nrhs,
+                                   const std::vector<integer_t>& iperm,
+                                   const std::vector<integer_t>& perm,
+                                   void* stream) const override;
 
     void extract_CB_sub_matrix(const std::vector<std::size_t>& I,
                                const std::vector<std::size_t>& J,
@@ -147,10 +153,18 @@ namespace strumpack {
 
     // S-HOST: when dp is set, b is the OUTPUT (solution) matrix and dp->braw the raw right-hand side; the
     // reordering (dp->d_iperm) is applied on the device before the solve, its inverse (dp->d_perm) after
-    struct DevPermArgs { const DenseM_t* braw; const int* d_iperm; const int* d_perm; };
+    // S2: with d_bin / d_xout set (braw null), the rhs is read from and the solution written to DEVICE memory
+    // (n x nrhs, ld n) and the solve is ordered on `stream` (cudaStream_t; the cache's own stream is forked
+    // from it and joined back into it with events): no host staging, no host synchronisation.
+    struct DevPermArgs {
+      const DenseM_t* braw; const int* d_iperm; const int* d_perm;
+      const scalar_t* d_bin = nullptr; scalar_t* d_xout = nullptr; void* stream = nullptr;
+    };
     void gpu_solve(DenseM_t& b, const DevPermArgs* dp=nullptr) const;
     struct DevPerm;   // S-HOST: cached device copy of the reordering permutation (iperm, perm)
     mutable std::unique_ptr<DevPerm> devperm_;
+    bool ensure_devperm(std::size_t n, const std::vector<integer_t>& iperm,
+                        const std::vector<integer_t>& perm) const;   // S-HOST/S2: (re)build devperm_ when stale
 
     // solve workspace (stream, handle, level info, device/pinned
     // buffers and metadata), built on the first solve and reused while

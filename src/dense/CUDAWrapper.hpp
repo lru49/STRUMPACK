@@ -79,6 +79,14 @@ namespace strumpack {
 #if defined(STRUMPACK_USE_MAGMA)
     const magma_queue_t& get_magma_queue(const Handle& h);
     magma_queue_t& get_magma_queue(Handle& s);
+
+    // S2 (magma-hpc, 2026-10-28): dst[i] = D(src[i]) for i < n on stream s (the mixed-precision solver's device
+    // casts of the rhs / solution around the inner solve_device); complex types are cast as 2n reals.
+    template<typename S, typename D>
+    void cast_array(const S* src, D* dst, std::size_t n, cudaStream_t s);
+    // gather_rows on a raw stream (used by the S2 plant only)
+    template<typename scalar_t> void
+    gather_rows_stream(cudaStream_t s, int n, int nrhs, const scalar_t* src, scalar_t* dst, const int* perm);
 #endif
 
 #if defined(STRUMPACK_USE_KBLAS)

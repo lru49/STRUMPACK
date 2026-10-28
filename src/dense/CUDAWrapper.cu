@@ -298,6 +298,42 @@ namespace strumpack {
       gather_rows_kernel<scalar_t><<<nb, nt, 0, streamId>>>(n, nrhs, src, dst, perm);
       gpu_check(cudaPeekAtLastError());
     }
+    template<typename scalar_t> void
+    gather_rows_stream(cudaStream_t streamId, int n, int nrhs, const scalar_t* src, scalar_t* dst, const int* perm) {
+      if (n <= 0 || nrhs <= 0) return;
+      const unsigned int nt = 256, nb = (unsigned int)(n + nt - 1) / nt;
+      gather_rows_kernel<scalar_t><<<nb, nt, 0, streamId>>>(n, nrhs, src, dst, perm);
+      gpu_check(cudaPeekAtLastError());
+    }
+    template void gather_rows_stream(cudaStream_t, int, int, const float*, float*, const int*);
+    template void gather_rows_stream(cudaStream_t, int, int, const double*, double*, const int*);
+    template void gather_rows_stream(cudaStream_t, int, int, const std::complex<float>*, std::complex<float>*, const int*);
+    template void gather_rows_stream(cudaStream_t, int, int, const std::complex<double>*, std::complex<double>*, const int*);
+
+    // S2: element-wise cast on a stream (grid-stride; the conversion is the same IEEE round-to-nearest as the host's
+    // static_cast, so a device cast and a host cast of the same value are bitwise equal)
+    template<typename S, typename D> __global__ void
+    cast_array_kernel(const S* __restrict__ src, D* __restrict__ dst, std::size_t n) {
+      for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x)
+        dst[i] = static_cast<D>(src[i]);
+    }
+    template<typename S, typename D>
+    void cast_array(const S* src, D* dst, std::size_t n, cudaStream_t s) {
+      if (!n) return;
+      const unsigned int nt = 256;
+      std::size_t nbl = (n + nt - 1) / nt; if (nbl > 4096) nbl = 4096;
+      const unsigned int nb = (unsigned int)nbl;
+      cast_array_kernel<S,D><<<nb, nt, 0, s>>>(src, dst, n);
+      gpu_check(cudaPeekAtLastError());
+    }
+    template<> void cast_array(const std::complex<double>* src, std::complex<float>* dst, std::size_t n, cudaStream_t s) {
+      cast_array<double,float>(reinterpret_cast<const double*>(src), reinterpret_cast<float*>(dst), 2 * n, s);
+    }
+    template<> void cast_array(const std::complex<float>* src, std::complex<double>* dst, std::size_t n, cudaStream_t s) {
+      cast_array<float,double>(reinterpret_cast<const float*>(src), reinterpret_cast<double*>(dst), 2 * n, s);
+    }
+    template void cast_array(const double*, float*, std::size_t, cudaStream_t);
+    template void cast_array(const float*, double*, std::size_t, cudaStream_t);
     template void gather_rows(Handle&, int, int, const float*, float*, const int*);
     template void gather_rows(Handle&, int, int, const double*, double*, const int*);
     template void gather_rows(Handle&, int, int, const std::complex<float>*, std::complex<float>*, const int*);

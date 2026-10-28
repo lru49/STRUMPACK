@@ -133,6 +133,17 @@ namespace strumpack {
                                             const std::vector<integer_t>& perm) const {
       return false;
     }
+    // S2 (magma-hpc, 2026-10-28): same as multifrontal_solve_devperm with DEVICE pointers: d_b (n x nrhs, ld n,
+    // raw / unpermuted) in, d_x (n x nrhs, ld n) out, everything ordered on the caller's stream (an opaque
+    // cudaStream_t; nullptr = the legacy default stream): no host staging and no host synchronisation; the
+    // front's own solve stream is forked from and joined back into `stream` with events. Only FrontMAGMA.
+    virtual bool multifrontal_solve_device(const scalar_t* d_b, scalar_t* d_x,
+                                           std::size_t n, int nrhs,
+                                           const std::vector<integer_t>& iperm,
+                                           const std::vector<integer_t>& perm,
+                                           void* stream) const {
+      return false;
+    }
 
     virtual void
     forward_multifrontal_solve(DenseM_t& b, DenseM_t* work,

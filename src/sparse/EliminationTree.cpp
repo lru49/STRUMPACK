@@ -172,6 +172,14 @@ namespace strumpack {
     return root_->multifrontal_solve_devperm(b, x, iperm, perm);
   }
 
+  template<typename scalar_t,typename integer_t> bool
+  EliminationTree<scalar_t,integer_t>::multifrontal_solve_device
+  (const scalar_t* d_b, scalar_t* d_x, std::size_t n, int nrhs,
+   const std::vector<integer_t>& iperm, const std::vector<integer_t>& perm,
+   void* stream) const {
+    return root_->multifrontal_solve_device(d_b, d_x, n, nrhs, iperm, perm, stream);
+  }
+
   template<typename scalar_t,typename integer_t> integer_t
   EliminationTree<scalar_t,integer_t>::maximum_rank() const {
     integer_t max_rank;

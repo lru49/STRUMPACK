@@ -48,6 +48,8 @@ namespace strumpack { namespace gpu {
 /**
  * All of STRUMPACK is contained in the strumpack namespace.
  */
+struct CUstream_st;   // S2: cudaStream_t is CUstream_st* (no CUDA header needed here)
+
 namespace strumpack {
 
   // forward declarations
@@ -229,6 +231,19 @@ namespace strumpack {
      * solver's double input into the float inner solver). With the sparsity unchanged the cast is folded into the
      * cached gather (no intermediate cast_matrix copy); otherwise cast + the regular update path.
      */
+    /**
+     * S2 (magma-hpc F track, 2026-10-28): solve with DEVICE pointers. d_b (input, N entries) and d_x (output,
+     * N entries) live in device memory; the whole solve, including the sparse reordering of b and of x, is
+     * ordered on `stream` (a cudaStream_t; nullptr = the legacy default stream) and returns without any host
+     * synchronisation or host staging. Independent solvers called with independent streams run concurrently.
+     * Only the direct GPU solve without matching and equilibration (KrylovSolver::DIRECT, MatchingJob::NONE,
+     * no equilibration, factors on the device) supports it: anything else returns ReturnCode::UNSUPPORTED and
+     * does nothing (use solve()). The factorization is computed first when it is not up to date (that part
+     * synchronises as factor() does).
+     */
+    ReturnCode solve_device(const scalar_t* d_b, scalar_t* d_x,
+                            CUstream_st* stream = nullptr);
+
     template<typename src_t>
     void update_matrix_values_from(const CSRMatrix<src_t,integer_t>& A) {
       if (!(mat_ && A.size() == mat_->size() && A.nnz() <= mat_->nnz())) {

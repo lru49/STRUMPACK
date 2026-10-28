@@ -404,14 +404,22 @@ namespace strumpack {
   }
   template<typename scalar_t,typename integer_t>
   struct FrontMAGMA<scalar_t,integer_t>::SolveCache {
-    SolveCache(int nrhs, std::size_t rows)
-      // F-GRAPH: the captured solve needs an own stream (the legacy default stream cannot be captured; all its ops
-      // are on that one stream anyway), eager mode keeps the window-121 legacy-stream default
-      : comp_stream((solve_legacy_stream() && !graph_solve_on()) ? 2 : 0), handle(comp_stream), nrhs(nrhs), rows(rows) {}
+    // S2: own_stream forces a private blocking stream (device-pointer mode: the K solvers' solves must not share
+    // the legacy default stream, or they serialise); otherwise the window-121 default (legacy stream) applies
+    SolveCache(int nrhs, std::size_t rows, bool own_stream=false)
+      // F-GRAPH: the captured solve needs an own stream as well (the legacy default stream cannot be captured)
+      : comp_stream((own_stream || !solve_legacy_stream() || graph_solve_on()) ? 0 : 2), handle(comp_stream), nrhs(nrhs), rows(rows), own_stream(own_stream) {
+      gpu_check(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
+      gpu_check(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
+    }
+    ~SolveCache() { cudaEventDestroy(ev_fork); cudaEventDestroy(ev_join); }
     gpu::Stream comp_stream;
     gpu::Handle handle;
+    // S2: fork / join of comp_stream with the caller's stream in the device-pointer solve (no host sync)
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     int nrhs;
     std::size_t rows;
+    bool own_stream = false;
     std::vector<LevelInfoMAGMA<scalar_t,integer_t>> ldata;
     std::vector<std::size_t> l_off;
     std::size_t Nmax = 0, Ntotal = 0, max_bupd_size = 0,
@@ -436,7 +444,7 @@ namespace strumpack {
     std::size_t n_solves = 0, n_meta_uploads = 0, n_mem_uploads = 0;
 #if defined(STRUMPACK_USE_CUDA)
     GraphExecHolder graph;        // the whole solve (H2D of the staged rhs .. D2H of the solution)
-    const void* gkey[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};   // pointers the captured graph bakes in
+    const void* gkey[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};   // pointers the captured graph bakes in
 #endif
     // S-INVDIAG: per converted level (nrhs == 1 only), per block step k the batch arrays of the block recurrence
     // (K*N entries each, step k at offset k*N): rows of block k (mL), columns of the L update (nLu) / U update (nUu),
@@ -1997,8 +2005,35 @@ namespace strumpack {
    const std::vector<integer_t>& perm) const {
     if (!dev_factors_) return false;
     const std::size_t n = x.rows();
-    if (std::size_t(b.rows()) != n || b.cols() != x.cols() ||
-        iperm.size() != n || perm.size() != n ||
+    if (std::size_t(b.rows()) != n || b.cols() != x.cols()) return false;
+    if (!ensure_devperm(n, iperm, perm)) return false;
+    DevPermArgs dp{&b, devperm_->d_iperm, devperm_->d_perm};
+    gpu_solve(x, &dp);
+    return true;
+  }
+
+  // S2 (magma-hpc, 2026-10-28): device-pointer solve. d_b / d_x are n x nrhs (ld n) in device memory, the
+  // reordering is applied on the device as in the S-HOST path; the solve cache's stream is forked from
+  // `stream` and joined back into it (events), so the caller sees one stream-ordered operation and K solvers
+  // with K caller streams overlap. No host staging, no host synchronisation.
+  template<typename scalar_t,typename integer_t> bool
+  FrontMAGMA<scalar_t,integer_t>::multifrontal_solve_device
+  (const scalar_t* d_b, scalar_t* d_x, std::size_t n, int nrhs,
+   const std::vector<integer_t>& iperm, const std::vector<integer_t>& perm,
+   void* stream) const {
+    if (!dev_factors_ || !d_b || !d_x || nrhs < 1 || d_b == d_x) return false;
+    if (!ensure_devperm(n, iperm, perm)) return false;
+    DenseMW_t xw(n, nrhs, nullptr, n);   // shape only: the data never touches the host in this mode
+    DevPermArgs dp{nullptr, devperm_->d_iperm, devperm_->d_perm, d_b, d_x, stream};
+    gpu_solve(xw, &dp);
+    return true;
+  }
+
+  template<typename scalar_t,typename integer_t> bool
+  FrontMAGMA<scalar_t,integer_t>::ensure_devperm
+  (std::size_t n, const std::vector<integer_t>& iperm,
+   const std::vector<integer_t>& perm) const {
+    if (iperm.size() != n || perm.size() != n ||
         n > std::size_t(std::numeric_limits<int>::max())) return false;
     if (!devperm_ || devperm_->key_iperm != iperm.data() ||
         devperm_->key_perm != perm.data() || devperm_->n != n) {
@@ -2018,8 +2053,6 @@ namespace strumpack {
         gpu::copy_host_to_device<int>(D.d_perm, t.data(), n);
       }
     }
-    DevPermArgs dp{&b, devperm_->d_iperm, devperm_->d_perm};
-    gpu_solve(x, &dp);
     return true;
   }
 
@@ -2060,9 +2093,13 @@ namespace strumpack {
   template<typename scalar_t,typename integer_t> void
   FrontMAGMA<scalar_t,integer_t>::gpu_solve(DenseM_t& b, const DevPermArgs* dp) const {
     int nrhs = b.cols();
+    // S2: the device-pointer mode needs the cache on a private stream (not the legacy default stream the host
+    // path uses since window 121): a cache built for the host path is rebuilt once (structure only) on first use
+    const bool want_own = dp && dp->d_bin;
     if (!solve_cache_ || solve_cache_->nrhs != nrhs ||
-        solve_cache_->rows != std::size_t(b.rows()))
-      solve_cache_.reset(new SolveCache(nrhs, b.rows()));
+        solve_cache_->rows != std::size_t(b.rows()) ||
+        (want_own && !solve_cache_->own_stream))
+      solve_cache_.reset(new SolveCache(nrhs, b.rows(), want_own));
     auto& C = *solve_cache_;
     // first solve with this cache: build level info and metadata
     const bool fresh = C.ldata.empty();
@@ -2484,6 +2521,15 @@ namespace strumpack {
     // the compute stream. STRUM_RHS_PIN=0 restores the pageable copies.
     static const bool rhs_pin = !(std::getenv("STRUM_RHS_PIN") && std::atoi(std::getenv("STRUM_RHS_PIN")) == 0);
     const std::size_t nb_elems = std::size_t(b.rows()) * nrhs;
+    // S2: device-pointer mode (no host staging): fork comp_stream from the caller's stream, gather the rhs
+    // straight from the caller's buffer; at the end the solution is gathered into the caller's buffer and the
+    // caller's stream joins comp_stream. F-GRAPH: the fork/join events stay outside the captured solve.
+    const bool dev_io = dp && dp->d_bin;
+    const cudaStream_t caller = dev_io ? static_cast<cudaStream_t>(dp->stream) : nullptr;
+    if (dev_io) {
+      gpu_check(cudaEventRecord(C.ev_fork, caller));
+      gpu_check(cudaStreamWaitEvent(gpu::get_cuda_stream(C.comp_stream), C.ev_fork, 0));
+    }
     // S-NOSYNC (magma-hpc, 2026-10-27): the per-level host-side synchronizations below are not needed for
     // correctness: comp_stream is a blocking stream (cudaStreamCreate), so its kernels are ordered against the
     // memsets / extend-add / extract kernels on the legacy default stream implicitly. Each host sync drained the
@@ -2495,13 +2541,15 @@ namespace strumpack {
     static const bool gsolve = graph_solve_on();
     // the first solve of a cache runs eagerly: MAGMA creates its workspace memory pools lazily on first use
     // (cudaMemPoolCreate inside a capture invalidates it); the capture is taken from the second solve on
-    bool gcap = gsolve && (dp || rhs_pin) && C.n_solves > 1;
+    bool gcap = gsolve && (dev_io || dp || rhs_pin) && C.n_solves > 1;
     // staging buffers (allocated outside any capture; their addresses are baked into the graph)
-    if (dp || rhs_pin) { if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems); }
-    if (dp) { if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems); }
-    scalar_t* hb = (dp || rhs_pin) ? static_cast<scalar_t*>(C.h_b) : nullptr;
-    scalar_t* d_braw = dp ? static_cast<scalar_t*>(C.d_braw) : nullptr;
-    if (dp) {
+    if (!dev_io && (dp || rhs_pin)) { if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems); }
+    if (!dev_io && dp) { if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems); }
+    scalar_t* hb = (!dev_io && (dp || rhs_pin)) ? static_cast<scalar_t*>(C.h_b) : nullptr;
+    scalar_t* d_braw = (!dev_io && dp) ? static_cast<scalar_t*>(C.d_braw) : nullptr;
+    if (dev_io) {
+      // nothing to stage: the rhs is read from the caller's device buffer
+    } else if (dp) {
       // S-HOST (magma-hpc, 2026-10-27): the right-hand side arrives RAW; stage it pinned, upload it and apply the
       // sparse reordering on the device, d_b(i,:) = braw(iperm[i],:), instead of the host pass in transform_b.
       const DenseM_t& br = *dp->braw;
@@ -2514,7 +2562,10 @@ namespace strumpack {
 
     // the device part of the solve; on_stream: everything on comp_stream (capturable), else the original mix
     auto issue_device = [&](bool on_stream) {
-      if (dp) {
+      if (dev_io) {
+        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, dp->d_bin, d_b, dp->d_iperm);
+        graph_trace("solve:gather", C.comp_stream);
+      } else if (dp) {
         gpu::copy_host_to_device_async<scalar_t>(d_braw, hb, nb_elems, C.comp_stream);
         graph_trace("solve:h2d", C.comp_stream);
         gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_braw, d_b, dp->d_iperm);
@@ -2724,7 +2775,16 @@ namespace strumpack {
               (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
         }
       }
-      if (dp) {
+      if (dev_io) {
+        // S2: undo the reordering straight into the caller's buffer (the join of the caller's stream follows below)
+#if defined(STRUM_PLANT_DEVSOLVE)
+        // PLANT devsolve-gather-wrong-stream (eager path): the output gather is issued on the CALLER's stream
+        // instead of comp_stream (and the join is dropped): it races the solve still running on comp_stream
+        if (!on_stream) gpu::gather_rows_stream<scalar_t>(caller, b.rows(), nrhs, d_b, dp->d_xout, dp->d_perm);
+        else
+#endif
+        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, dp->d_xout, dp->d_perm);
+      } else if (dp) {
         // S-HOST: undo the reordering on the device, x(i,:) = y(perm[i],:), then download (replaces transform_x)
         gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, d_braw, dp->d_perm);
         gpu::copy_device_to_host_async<scalar_t>(hb, d_braw, nb_elems, C.comp_stream);
@@ -2738,9 +2798,9 @@ namespace strumpack {
 
 #if defined(STRUMPACK_USE_CUDA)
     if (gcap) {
-      const void* key[5] = { dp ? static_cast<const void*>(dp) : nullptr, dp ? dp->d_iperm : nullptr,
-                             dp ? dp->d_perm : nullptr, hb, d_braw };
-      key[0] = dp ? reinterpret_cast<const void*>(1) : nullptr;
+      // the pointers the captured solve bakes in (S2: the caller's device buffers too)
+      const void* key[7] = { dp ? reinterpret_cast<const void*>(dev_io ? 2 : 1) : nullptr, dp ? dp->d_iperm : nullptr,
+                             dp ? dp->d_perm : nullptr, hb, d_braw, dev_io ? dp->d_bin : nullptr, dev_io ? dp->d_xout : nullptr };
       if (C.graph.valid() && std::memcmp(key, C.gkey, sizeof(key)) != 0) C.graph.reset();
       if (C.graph.valid()) graph_launch(C.graph, C.comp_stream);
       else {
@@ -2758,7 +2818,13 @@ namespace strumpack {
     } else
 #endif
       issue_device(false);
-    if (dp || rhs_pin) {
+    if (dev_io) {
+#if !defined(STRUM_PLANT_DEVSOLVE)
+      // S2: join the caller's stream (no host sync)
+      gpu_check(cudaEventRecord(C.ev_join, gpu::get_cuda_stream(C.comp_stream)));
+      gpu_check(cudaStreamWaitEvent(caller, C.ev_join, 0));
+#endif
+    } else if (dp || rhs_pin) {
       C.comp_stream.synchronize();
       if (b.ld() == b.rows()) std::copy(hb, hb + nb_elems, b.data());
       else for (int j=0; j<nrhs; j++) std::copy(hb + std::size_t(j) * b.rows(), hb + std::size_t(j+1) * b.rows(), b.ptr(0, j));
