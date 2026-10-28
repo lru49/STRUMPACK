@@ -2543,10 +2543,15 @@ namespace strumpack {
     // (cudaMemPoolCreate inside a capture invalidates it); the capture is taken from the second solve on
     bool gcap = gsolve && (dev_io || dp || rhs_pin) && C.n_solves > 1;
     // staging buffers (allocated outside any capture; their addresses are baked into the graph)
+    // F-GRAPH + S2: under capture the caller's device buffers (which change from call to call) are not baked
+    // into the graph; the rhs is copied D2D into the cache's d_braw before the launch and the solution copied out
+    // of it after (2 x n*nrhs elements, microseconds), so one graph serves every call
+    const bool dev_stage = dev_io && gcap;
     if (!dev_io && (dp || rhs_pin)) { if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems); }
-    if (!dev_io && dp) { if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems); }
+    if ((!dev_io && dp) || dev_stage) { if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems); }
     scalar_t* hb = (!dev_io && (dp || rhs_pin)) ? static_cast<scalar_t*>(C.h_b) : nullptr;
-    scalar_t* d_braw = (!dev_io && dp) ? static_cast<scalar_t*>(C.d_braw) : nullptr;
+    scalar_t* d_braw = ((!dev_io && dp) || dev_stage) ? static_cast<scalar_t*>(C.d_braw) : nullptr;
+    if (dev_stage) gpu::copy_device_to_device_async<scalar_t>(d_braw, dp->d_bin, nb_elems, C.comp_stream);
     if (dev_io) {
       // nothing to stage: the rhs is read from the caller's device buffer
     } else if (dp) {
@@ -2563,7 +2568,7 @@ namespace strumpack {
     // the device part of the solve; on_stream: everything on comp_stream (capturable), else the original mix
     auto issue_device = [&](bool on_stream) {
       if (dev_io) {
-        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, dp->d_bin, d_b, dp->d_iperm);
+        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, dev_stage ? d_braw : dp->d_bin, d_b, dp->d_iperm);
         graph_trace("solve:gather", C.comp_stream);
       } else if (dp) {
         gpu::copy_host_to_device_async<scalar_t>(d_braw, hb, nb_elems, C.comp_stream);
@@ -2783,7 +2788,7 @@ namespace strumpack {
         if (!on_stream) gpu::gather_rows_stream<scalar_t>(caller, b.rows(), nrhs, d_b, dp->d_xout, dp->d_perm);
         else
 #endif
-        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, dp->d_xout, dp->d_perm);
+        gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, dev_stage ? d_braw : dp->d_xout, dp->d_perm);
       } else if (dp) {
         // S-HOST: undo the reordering on the device, x(i,:) = y(perm[i],:), then download (replaces transform_x)
         gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, d_braw, dp->d_perm);
@@ -2800,7 +2805,7 @@ namespace strumpack {
     if (gcap) {
       // the pointers the captured solve bakes in (S2: the caller's device buffers too)
       const void* key[7] = { dp ? reinterpret_cast<const void*>(dev_io ? 2 : 1) : nullptr, dp ? dp->d_iperm : nullptr,
-                             dp ? dp->d_perm : nullptr, hb, d_braw, dev_io ? dp->d_bin : nullptr, dev_io ? dp->d_xout : nullptr };
+                             dp ? dp->d_perm : nullptr, hb, d_braw, nullptr, nullptr };   // dev_stage: caller buffers not baked in
       if (C.graph.valid() && std::memcmp(key, C.gkey, sizeof(key)) != 0) C.graph.reset();
       if (C.graph.valid()) graph_launch(C.graph, C.comp_stream);
       else {
@@ -2819,6 +2824,7 @@ namespace strumpack {
 #endif
       issue_device(false);
     if (dev_io) {
+      if (dev_stage) gpu::copy_device_to_device_async<scalar_t>(dp->d_xout, d_braw, nb_elems, C.comp_stream);
 #if !defined(STRUM_PLANT_DEVSOLVE)
       // S2: join the caller's stream (no host sync)
       gpu_check(cudaEventRecord(C.ev_join, gpu::get_cuda_stream(C.comp_stream)));
