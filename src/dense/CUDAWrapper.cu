@@ -303,6 +303,144 @@ namespace strumpack {
     template void gather_rows(Handle&, int, int, const std::complex<float>*, std::complex<float>*, const int*);
     template void gather_rows(Handle&, int, int, const std::complex<double>*, std::complex<double>*, const int*);
 
+    // S-GEMVBATCH (magma-hpc, 2026-10-28), see GPUWrapper.hpp. Block (R rows, G lane-threads): CTA = lane group g of a
+    // row block; the L = S x DIM_Y lanes of a row (column chunk s, interleave t) are computed by NG = ceil(L/G) CTAs
+    // (NG > 1: partials to a workspace, the last-arriving CTA of the row block folds them) and folded in lane order by
+    // the row's first thread exactly as MAGMA's gemvn_vbatched / G-GEMV1 split-K reduce fold them (bitwise). The x vector is staged
+    // in shared memory (fwd: the front's solution block; bwd: gathered from the global solution with the update
+    // indices). fwd epilogue: the last-arriving CTA of a parent front performs the parent's extend-add, left child
+    // then right child (threadfence + counter; data writes have no races: a child's rows map to distinct parent rows).
+    template<typename T, bool FWD> __global__ void __launch_bounds__(1024)
+    gemvb_kernel(const GemvbArgs<T> P) {
+      extern __shared__ __align__(16) char gemvb_smem[];
+      T* xs = reinterpret_cast<T*>(gemvb_smem);
+      T* red = xs + P.nmax;                               // [G][R]
+      __shared__ int s_last;
+      const int* it = P.items + 4*blockIdx.x;
+      const int f = it[0], row0 = it[1], g = it[2], slot = it[3];
+      const int m = P.m[f], n = P.n[f], ld = P.ld[f];
+      const int R = blockDim.x, G = blockDim.y, tx = threadIdx.x, ty = threadIdx.y, nt = R*G, tid = tx + ty*R;
+      const int DY = P.DIM_Y, L = P.L, NG = P.NG, chunk = P.chunk;
+      // stage only the columns this lane group touches: lanes [g*G, g*G+G) = chunks [g*G/DY, (g*G+G-1)/DY]
+      const int c_lo = min(n, (g*G / DY) * chunk), c_hi = min(n, (min(L, g*G + G) - 1) / DY * chunk + chunk);
+      if (FWD) { const T* xsrc = P.x[f]; for (int j=c_lo+tid; j<c_hi; j+=nt) xs[j-c_lo] = xsrc[j]; }
+      else { const int* u = P.upd[f]; const T* xg = P.xg; for (int j=c_lo+tid; j<c_hi; j+=nt) xs[j-c_lo] = xg[u[j]]; }
+      __syncthreads();
+      const int row = row0 + tx;
+      const bool act = row < m;
+      const T* Ar = P.A[f] + (act ? row : 0);
+      const T* xl = xs - c_lo;
+      const int lane = g*G + ty;
+      T p = T(0);
+      if (act && lane < L) {
+        const int s = lane / DY, t = lane - s*DY;
+        const int c0 = s*chunk, c1 = min(n, c0 + chunk);
+        int col = c0 + t;
+        for (; col + 3*DY < c1; col += 4*DY) {
+          const T a0 = __ldg(Ar + col*ld), a1 = __ldg(Ar + (col+DY)*ld), a2 = __ldg(Ar + (col+2*DY)*ld), a3 = __ldg(Ar + (col+3*DY)*ld);
+          p = fma(a0, xl[col], p); p = fma(a1, xl[col+DY], p); p = fma(a2, xl[col+2*DY], p); p = fma(a3, xl[col+3*DY], p);
+        }
+        for (; col < c1; col += DY) p = fma(__ldg(Ar + col*ld), xl[col], p);
+      }
+      // fold of the lanes in order: cs_s = ((p_{s,0} + p_{s,1}) + ...) as MAGMA's sdata[0] += sdata[j];
+      // res = cs_0 (one chunk) or 0 + cs_0 + cs_1 + ... (split-K reduce); chunks without columns are never summed
+      T res = T(0), cs = T(0);
+      auto fold = [&](int k, int kend) {
+        for (int q = 0; q < G && k + q < kend; q++) {
+          const int lq = k + q, s = lq / DY, t = lq - s*DY;
+          if (s*chunk >= n) break;
+          const T pq = red[q*R + tx];
+          cs = (t == 0) ? pq : cs + pq;
+          if (t == DY-1) res = P.split ? res + cs : cs;
+        }
+      };
+      if (NG == 1) {
+        red[ty*R + tx] = p;
+        __syncthreads();
+        if (ty == 0 && act) fold(0, L);
+      } else {
+        T* wsp = P.ws + std::size_t(slot) * L * R;
+        if (lane < L) wsp[lane*R + tx] = p;
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+          const int old = atomicAdd(P.slot_counters + slot, 1);
+          const int last = (old == NG - 1);
+          if (last) P.slot_counters[slot] = 0;
+          s_last = last;
+        }
+        __syncthreads();
+        if (!s_last) return;
+        __threadfence();
+        for (int k = 0; k < L; k += G) {
+          const int ln = k + ty;
+          red[ty*R + tx] = (ln < L) ? __ldcg(wsp + ln*R + tx) : T(0);
+          __syncthreads();
+          if (ty == 0 && act) fold(k, L);
+          __syncthreads();
+        }
+      }
+      if (ty == 0 && act && n > 0) { T* y = P.y[f]; y[row] = y[row] - res; }   // alpha*res + beta*y, alpha = -1, beta = 1
+      if (FWD) {
+        const int pf = P.parent[f];
+        if (pf < 0) return;
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+          const int old = atomicAdd(P.counters + pf, 1);
+          const int last = (old == P.expected[pf] - 1);
+          if (last) P.counters[pf] = 0;
+          s_last = last;
+        }
+        __syncthreads();
+        if (!s_last) return;
+        __threadfence();
+        const AssembleData<T>& a = P.pa[pf];
+        T* bp = a.F11; T* bup = a.F21;
+        const std::size_t d1 = a.d1;
+        if (a.CB1) {
+          const T* cb = a.CB1; const std::size_t* I = a.I1;
+          for (int r=tid; r<a.dCB1; r+=nt) {
+            const std::size_t i = I[r]; const T v = __ldcg(cb + r);
+            if (i < d1) bp[i] = __ldcg(bp + i) + v; else bup[i-d1] = __ldcg(bup + i - d1) + v;
+          }
+        }
+        __syncthreads();
+        if (a.CB2) {
+          const T* cb = a.CB2; const std::size_t* I = a.I2;
+          for (int r=tid; r<a.dCB2; r+=nt) {
+            const std::size_t i = I[r]; const T v = __ldcg(cb + r);
+            if (i < d1) bp[i] = __ldcg(bp + i) + v; else bup[i-d1] = __ldcg(bup + i - d1) + v;
+          }
+        }
+      }
+    }
+    template<typename T, bool FWD> bool
+    gemvb_launch(Handle& handle, const GemvbArgs<T>& P) {
+      if (P.nitems <= 0) return true;
+      cudaStream_t streamId;
+      cublasGetStream(get_cublas_handle(handle), &streamId);
+      const std::size_t smem = (std::size_t(P.nmax) + std::size_t(P.G) * P.R) * sizeof(T);
+      if (smem > 48 * 1024) {
+        static bool opted = false;
+        if (!opted) { cudaFuncSetAttribute(gemvb_kernel<T,FWD>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); opted = true; }
+      }
+      dim3 block(P.R, P.G);
+      gemvb_kernel<T,FWD><<<P.nitems, block, smem, streamId>>>(P);
+      gpu_check(cudaPeekAtLastError());
+      return true;
+    }
+    template<typename scalar_t> bool gemvb_fwd(Handle&, const GemvbArgs<scalar_t>&) { return false; }
+    template<typename scalar_t> bool gemvb_bwd(Handle&, const GemvbArgs<scalar_t>&) { return false; }
+    template<> bool gemvb_fwd<float>(Handle& h, const GemvbArgs<float>& P) { return gemvb_launch<float,true>(h, P); }
+    template<> bool gemvb_fwd<double>(Handle& h, const GemvbArgs<double>& P) { return gemvb_launch<double,true>(h, P); }
+    template<> bool gemvb_bwd<float>(Handle& h, const GemvbArgs<float>& P) { return gemvb_launch<float,false>(h, P); }
+    template<> bool gemvb_bwd<double>(Handle& h, const GemvbArgs<double>& P) { return gemvb_launch<double,false>(h, P); }
+    template bool gemvb_fwd(Handle&, const GemvbArgs<std::complex<float>>&);
+    template bool gemvb_fwd(Handle&, const GemvbArgs<std::complex<double>>&);
+    template bool gemvb_bwd(Handle&, const GemvbArgs<std::complex<float>>&);
+    template bool gemvb_bwd(Handle&, const GemvbArgs<std::complex<double>>&);
+
     template<typename scalar_t> void
     laswp_fwd_vbatched(Handle& handle, int* dn, int max_n,
                        scalar_t** dA, int* lddA, int** dipiv, int* npivots,
