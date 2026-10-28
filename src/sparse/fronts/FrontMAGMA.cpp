@@ -27,6 +27,7 @@
  *
  */
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #if defined(STRUMPACK_USE_CUDA)
 #include <cuda_runtime_api.h>
@@ -540,11 +541,20 @@ namespace strumpack {
       build_factor_cache(A, ldata);
     }
     ReturnCode err_code = ReturnCode::SUCCESS;
+    static const bool pack_verbose = std::getenv("STRUM_DEVUPDATE_VERBOSE") && std::atoi(std::getenv("STRUM_DEVUPDATE_VERBOSE")) != 0;
+    const auto t_f0 = std::chrono::steady_clock::now();
     solve_cache_.reset(); // new factors: rebuild the solve workspace
     devperm_.reset();     // S-HOST: and the device permutation
+    const auto t_f1 = std::chrono::steady_clock::now();
     auto& C = *factor_cache_;
     gpu::Stream comp_stream;
     gpu::Handle handle(comp_stream);
+    if (pack_verbose) {   // item-5 audit: host time before the values are touched
+      const auto t_f2 = std::chrono::steady_clock::now();
+      std::cout << "# F-PACK factor_start solve_cache_reset_ms "
+                << std::chrono::duration<double,std::milli>(t_f1 - t_f0).count()
+                << " stream_handle_create_ms " << std::chrono::duration<double,std::milli>(t_f2 - t_f1).count() << std::endl;
+    }
     // F-DEVUPDATE: when the value update ran on the device, the permuted values are already there
     // (the source waits for its upload and verifies it); nothing is copied at the start of the factorization
     const scalar_t* vals = nullptr;
@@ -1342,6 +1352,8 @@ namespace strumpack {
     auto& C = *solve_cache_;
     // first solve with this cache: build level info and metadata
     const bool fresh = C.ldata.empty();
+    static const bool pack_verbose = std::getenv("STRUM_DEVUPDATE_VERBOSE") && std::atoi(std::getenv("STRUM_DEVUPDATE_VERBOSE")) != 0;
+    const auto t_s0 = std::chrono::steady_clock::now();
     auto& handle = C.handle;
     const int lvls = this->levels();
     auto& ldata = C.ldata;
@@ -1509,6 +1521,10 @@ namespace strumpack {
         }
         C.perm_ready = true;
       }
+      if (pack_verbose)
+        std::cout << "# F-PACK solve_cache_build_ms "
+                  << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_s0).count()
+                  << " (level info + meta-data + uploads + pivot permutations, once per factorization)" << std::endl;
     }
     C.n_solves++;
     // copy rhs, from pageable memory (input)

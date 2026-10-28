@@ -1,6 +1,7 @@
 // F-DEVUPDATE kernels (see DeviceValueUpdate.hpp): gather with the cached
 // symmetrize+permute map, and a strided sample of the uploaded raw values.
 #include <cuda_runtime.h>
+#include <thrust/complex.h>
 #include <complex>
 #include <cstdlib>
 
@@ -9,6 +10,9 @@
 
 namespace strumpack {
   namespace gpu {
+
+    template<class T> struct cuda_type { typedef T value_type; };
+    template<class T> struct cuda_type<std::complex<T>> { typedef thrust::complex<T> value_type; };
 
     // out[k] = map[k] > 0 ? raw[map[k]-1] : 0 (the explicit zeros of the symmetrization)
     template<typename T, typename I> __global__ void
