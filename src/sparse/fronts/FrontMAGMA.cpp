@@ -1050,7 +1050,7 @@ namespace strumpack {
       gpu_check(cudaEventDestroy(ev));
     }
     if (dsrc) dsrc->factor_enqueued();   // F-DEVUPDATE: host write-back now, overlapping the kernels above
-    if (invdiag::verbose() && C.inv_bytes) {
+    if (invdiag::verbose() && C.inv_bytes && gmode == 0) {
       std::cout << "# INVDIAG factorization";
       for (int l=0; l<C.lvls; l++) {
         if (!C.inv[l].on) continue;
@@ -1349,7 +1349,9 @@ namespace strumpack {
     auto& V = C.inv[l];
     auto& L = C.ldata[l];
     const magma_int_t N = L.Nsmall;
-    const int verbose = invdiag::verbose();
+    // F-GRAPH: no timing events / host checks inside a graph capture (events recorded in a capture carry no
+    // timing; cudaEventElapsedTime on them leaves a sticky error) -> the INVDIAG verbose timing is off in graph mode
+    const int verbose = graph_mode() != 0 ? 0 : invdiag::verbose();
     cudaStream_t st = magma_queue_get_cuda_stream(gpu::get_magma_queue(handle));
     if (verbose) cudaEventRecord(C.inv_t0[l], st);
     cudaMemsetAsync(V.d_inv.template as<scalar_t>(), 0, 2 * V.side_elems * sizeof(scalar_t), st);
