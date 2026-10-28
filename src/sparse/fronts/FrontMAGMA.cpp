@@ -408,7 +408,8 @@ namespace strumpack {
     // the legacy default stream, or they serialise); otherwise the window-121 default (legacy stream) applies
     SolveCache(int nrhs, std::size_t rows, bool own_stream=false)
       // F-GRAPH: the captured solve needs an own stream as well (the legacy default stream cannot be captured)
-      : comp_stream((own_stream || !solve_legacy_stream() || graph_solve_on()) ? 0 : 2), handle(comp_stream), nrhs(nrhs), rows(rows), own_stream(own_stream) {
+      : comp_stream((own_stream || !solve_legacy_stream() || graph_solve_on()) ? 0 : 2), handle(comp_stream), nrhs(nrhs), rows(rows),
+        own_stream(own_stream || !solve_legacy_stream() || graph_solve_on()) {   // a cache already on an own stream serves the device-pointer mode too (no rebuild per API switch)
       gpu_check(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
       gpu_check(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
     }
