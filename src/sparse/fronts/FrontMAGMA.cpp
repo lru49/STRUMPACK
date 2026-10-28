@@ -885,11 +885,11 @@ namespace strumpack {
       static const bool level_info = std::getenv("STRUM_LEVEL_INFO") != nullptr;
       if (level_info) {
         std::size_t max_d1 = 0, max_d2 = 0, sum_d1 = 0, sum_d2 = 0;
-        double gemm_flops = 0., getrf_flops = 0., trsm_flops = 0.;
+        double gemm_flops = 0., getrf_flops = 0., trsm_flops = 0., sum_d1d2 = 0., sum_d1sq = 0.;
         for (auto f : L.f) {
           const double d1 = f->dim_sep(), d2 = f->dim_upd();
           max_d1 = std::max<std::size_t>(max_d1, d1); max_d2 = std::max<std::size_t>(max_d2, d2);
-          sum_d1 += d1; sum_d2 += d2;
+          sum_d1 += d1; sum_d2 += d2; sum_d1d2 += d1 * d2; sum_d1sq += d1 * d1;
           gemm_flops += 2. * d2 * d2 * d1; getrf_flops += 2. / 3. * d1 * d1 * d1; trsm_flops += 2. * d1 * d1 * d2;
         }
         std::cout << "# LEVEL_INFO level " << l << " fronts " << L.f.size() << " max_d1 " << max_d1 << " max_d2 " << max_d2
@@ -897,7 +897,8 @@ namespace strumpack {
                   << " getrf_gflop " << getrf_flops / 1e9 << " trsm_gflop " << trsm_flops / 1e9
                   << " level_flops " << level_flops << " small_flops " << small_flops
                   << " factor_MB " << L.factor_bytes / 1e6 << " work_MB " << L.work_bytes / 1e6 << " ea_MB " << L.ea_bytes / 1e6
-                  << " elems " << L.elems11.back() + L.elems12.back() + L.elems21.back() << std::endl;
+                  << " elems " << L.elems11.back() + L.elems12.back() + L.elems21.back()
+                  << " sum_d1d2 " << sum_d1d2 << " sum_d1sq " << sum_d1sq << std::endl;
       }
     }
     return err_code;
