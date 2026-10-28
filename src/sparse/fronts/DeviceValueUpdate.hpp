@@ -62,10 +62,13 @@ namespace strumpack {
                    std::size_t nnz_in, scalar_t* host_vals);
 
       /**
-       * Enqueue: raw (nnz_in values, caller's array) -> device, gather,
-       * write-back to host_vals. Returns at once. false = the device
+       * Enqueue: raw (nnz_in values, caller's array) -> device, gather
+       * (cast src_t -> scalar_t on the device for the mixed-precision
+       * solver's double input). Returns at once. false = the device
        * path is not available (the caller must update on the host).
        */
+      template<typename src_t>
+      bool update_from(const src_t* raw, std::size_t nnz_in);
       bool update(const scalar_t* raw, std::size_t nnz_in);
 
       /** The host values were written by the host path: the device copy is stale. */
@@ -76,7 +79,8 @@ namespace strumpack {
 
       const scalar_t* device_values(std::size_t nnz,
                                     unsigned long long* generation) override;
-      void release_device_values() override;
+      void factor_enqueued() override;
+      void sync_host_values() override;
 
       struct Impl;
     private:

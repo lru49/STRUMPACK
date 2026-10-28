@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <complex>
 
@@ -58,17 +59,20 @@ namespace strumpack {
 
     template<typename scalar_t, typename integer_t>
     struct DeviceValueUpdater<scalar_t,integer_t>::Impl {
-      static constexpr int NS = 4096;   // verification samples
-      cudaStream_t stream = nullptr;    // non-blocking: nothing of the factorization waits on it implicitly
+      static constexpr int NS = 4096;           // verification samples
+      static constexpr std::size_t MAX_ELEM = 16; // largest raw element (complex<double>)
+      cudaStream_t stream = nullptr;            // non-blocking: nothing of the factorization waits on it implicitly
       cudaEvent_t e_order = nullptr, e_start = nullptr, e_copied = nullptr, e_gathered = nullptr,
         e_ready = nullptr, e_wb = nullptr;
-      DeviceMemory<scalar_t> d_raw, d_out, d_samp;
+      DeviceMemory<char> d_raw, d_samp;         // raw values (src_t), samples (src_t)
+      DeviceMemory<scalar_t> d_out;             // the permuted values, consumed by the factorization
       DeviceMemory<integer_t> d_map;
-      HostMemory<scalar_t> h_stage, h_samp;
-      std::size_t nnz = 0, nnz_in = 0;
-      scalar_t* host_vals = nullptr;    // the matrix' own values (write-back target)
+      HostMemory<char> h_stage, h_samp;
+      std::size_t nnz = 0, nnz_in = 0, raw_elem = 0;
+      scalar_t* host_vals = nullptr;            // the matrix' own values (write-back target)
       HostReg reg_raw, reg_host;
-      const scalar_t* raw_ptr = nullptr;
+      const void* raw_ptr = nullptr;
+      std::function<void(bool)> redo;           // re-enqueue of the last update (repair path)
       unsigned long long gen = 0;
       bool map_ok = false, current = false, wb_pending = false, copied_once = false;
       bool pinned_last = false, staged_warned = false;
@@ -87,7 +91,8 @@ namespace strumpack {
         gpu_check(cudaEventCreate(&e_gathered));
         gpu_check(cudaEventCreateWithFlags(&e_ready, cudaEventDisableTiming));
         gpu_check(cudaEventCreateWithFlags(&e_wb, cudaEventDisableTiming));
-        h_samp = HostMemory<scalar_t>(NS);
+        h_samp = HostMemory<char>(std::size_t(NS) * MAX_ELEM);
+        d_samp = DeviceMemory<char>(std::size_t(NS) * MAX_ELEM);
       }
       ~Impl() {
         if (stream) cudaStreamSynchronize(stream);
@@ -100,11 +105,11 @@ namespace strumpack {
 
       int nsamples() const { return int(std::min<std::size_t>(std::size_t(NS), nnz_in)); }
 
-      // raw -> d_raw (chunked), gather, samples, write-back; all on `stream`
-      void enqueue(const scalar_t* raw, bool try_pin) {
-        const std::size_t bytes = nnz_in * sizeof(scalar_t);
+      // raw -> d_raw (chunked), gather(+cast), samples; all on `stream`
+      template<typename src_t> void enqueue(const src_t* raw, bool try_pin) {
+        const std::size_t bytes = nnz_in * sizeof(src_t);
         // order after everything queued on the legacy default stream (the previous factorization reads d_out
-        // there) and, through stream order, after our own previous work
+        // there) and, through stream order, after our own previous work (incl. the write-back reading d_out)
         gpu_check(cudaEventRecord(e_order, 0));
         gpu_check(cudaStreamWaitEvent(stream, e_order, 0));
         const bool pinned = try_pin && pin && reg_raw.ensure(raw, bytes);
@@ -113,48 +118,44 @@ namespace strumpack {
             std::cout << "# F-DEVUPDATE: value array not page-locked, staged copy" << std::endl;
             staged_warned = true;
           }
-          if (h_stage.size() < nnz_in) h_stage = HostMemory<scalar_t>(nnz_in);
+          if (h_stage.size() < bytes) h_stage = HostMemory<char>(bytes);
           if (copied_once) gpu_check(cudaEventSynchronize(e_copied));   // previous use of the staging buffer
         }
+        src_t* d_raw_t = reinterpret_cast<src_t*>(d_raw.template as<char>());
         gpu_check(cudaEventRecord(e_start, stream));
         const std::size_t chunk = (nnz_in + nchunks - 1) / nchunks;
         for (int c=0; c<nchunks; c++) {
           const std::size_t lo = std::size_t(c)*chunk, hi = std::min(nnz_in, lo+chunk);
           if (lo >= hi) break;
-          const scalar_t* src = raw + lo;
+          const src_t* src = raw + lo;
           if (!pinned) {
-            scalar_t* stg = h_stage.data() + lo;
+            src_t* stg = reinterpret_cast<src_t*>(h_stage.data()) + lo;
 #pragma omp parallel for
             for (std::size_t k=0; k<hi-lo; k++) stg[k] = raw[lo+k];
             src = stg;
           }
-          gpu_check(cudaMemcpyAsync(d_raw.template as<scalar_t>() + lo, src, (hi-lo)*sizeof(scalar_t),
-                                    cudaMemcpyHostToDevice, stream));
+          gpu_check(cudaMemcpyAsync(d_raw_t + lo, src, (hi-lo)*sizeof(src_t), cudaMemcpyHostToDevice, stream));
         }
         gpu_check(cudaEventRecord(e_copied, stream));
         copied_once = true;
-        devupd_gather<scalar_t,integer_t>(nnz, nnz_in, d_map, d_raw, d_out, stream);
+        devupd_gather<scalar_t,src_t,integer_t>(nnz, nnz_in, d_map, d_raw_t, d_out, stream);
         gpu_check(cudaEventRecord(e_gathered, stream));
         const int ns = nsamples();
-        devupd_sample<scalar_t>(ns, nnz_in, d_raw, d_samp, stream);
-        gpu_check(cudaMemcpyAsync(h_samp.data(), d_samp.template as<scalar_t>(), ns*sizeof(scalar_t),
+        devupd_sample<src_t>(ns, nnz_in, d_raw_t, reinterpret_cast<src_t*>(d_samp.template as<char>()), stream);
+        gpu_check(cudaMemcpyAsync(h_samp.data(), d_samp.template as<char>(), ns*sizeof(src_t),
                                   cudaMemcpyDeviceToHost, stream));
         gpu_check(cudaEventRecord(e_ready, stream));
-        if (writeback) {
-          gpu_check(cudaMemcpyAsync(host_vals, d_out.template as<scalar_t>(), nnz*sizeof(scalar_t),
-                                    cudaMemcpyDeviceToHost, stream));
-          wb_pending = true;
-        }
-        gpu_check(cudaEventRecord(e_wb, stream));
-        raw_ptr = raw;
+        raw_ptr = raw; raw_elem = sizeof(src_t);
         pinned_last = pinned;
       }
 
       // the uploaded samples must match the host array (catches a stale registration / a modified array)
       bool verify() const {
         const int ns = nsamples();
+        const char* raw = static_cast<const char*>(raw_ptr);
         for (int i=0; i<ns; i++)
-          if (std::memcmp(&h_samp.data()[i], raw_ptr + devupd_sample_index(i, ns, nnz_in), sizeof(scalar_t)))
+          if (std::memcmp(h_samp.data() + std::size_t(i)*raw_elem,
+                          raw + devupd_sample_index(i, ns, nnz_in)*raw_elem, raw_elem))
             return false;
         return true;
       }
@@ -185,8 +186,6 @@ namespace strumpack {
       try {
         if (I.d_map.size() < nnz) I.d_map = DeviceMemory<integer_t>(nnz);
         if (I.d_out.size() < nnz) I.d_out = DeviceMemory<scalar_t>(nnz);
-        if (I.d_raw.size() < nnz_in) I.d_raw = DeviceMemory<scalar_t>(nnz_in);
-        if (!I.d_samp.size()) I.d_samp = DeviceMemory<scalar_t>(Impl::NS);
       } catch (const std::bad_alloc&) {
         I.d_map.release(); I.d_out.release(); I.d_raw.release();
         I.reg_host.unregister();
@@ -194,23 +193,37 @@ namespace strumpack {
         return false;
       }
       gpu_check(cudaMemcpy(I.d_map.template as<integer_t>(), map, nnz*sizeof(integer_t), cudaMemcpyHostToDevice));
-      gpu_check(cudaMemset(I.d_raw.template as<scalar_t>(), 0, nnz_in*sizeof(scalar_t)));
       I.nnz = nnz; I.nnz_in = nnz_in; I.host_vals = host_vals;
       I.map_ok = true;
       return true;
     }
 
-    template<typename scalar_t, typename integer_t> bool
-    DeviceValueUpdater<scalar_t,integer_t>::update(const scalar_t* raw, std::size_t nnz_in) {
+    template<typename scalar_t, typename integer_t> template<typename src_t> bool
+    DeviceValueUpdater<scalar_t,integer_t>::update_from(const src_t* raw, std::size_t nnz_in) {
       auto& I = *impl_;
       if (!I.map_ok || nnz_in != I.nnz_in || !raw) return false;
       const auto t0 = std::chrono::steady_clock::now();
-      I.enqueue(raw, true);   // stream order keeps it behind the previous write-back
+      const std::size_t bytes = nnz_in * sizeof(src_t);
+      if (I.d_raw.size() < bytes) {   // raw buffer sized for the source type (first update / larger type)
+        try { I.d_raw = DeviceMemory<char>(bytes); }
+        catch (const std::bad_alloc&) {
+          if (I.verbose) std::cout << "# F-DEVUPDATE: out of device memory for the raw values, host update" << std::endl;
+          return false;
+        }
+        gpu_check(cudaMemset(I.d_raw.template as<char>(), 0, bytes));
+      }
+      I.template enqueue<src_t>(raw, true);
+      I.redo = [&I, raw](bool try_pin) { I.template enqueue<src_t>(raw, try_pin); };
       I.gen++;
       I.current = true;
       I.t_update = t0;
       I.host_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t0).count();
       return true;
+    }
+
+    template<typename scalar_t, typename integer_t> bool
+    DeviceValueUpdater<scalar_t,integer_t>::update(const scalar_t* raw, std::size_t nnz_in) {
+      return update_from<scalar_t>(raw, nnz_in);
     }
 
     template<typename scalar_t, typename integer_t> void
@@ -225,7 +238,7 @@ namespace strumpack {
       I.map_ok = I.current = I.wb_pending = false;
       I.reg_raw.unregister();
       I.reg_host.unregister();
-      I.host_vals = nullptr; I.raw_ptr = nullptr;
+      I.host_vals = nullptr; I.raw_ptr = nullptr; I.redo = nullptr;
       I.nnz = I.nnz_in = 0;
     }
 
@@ -243,9 +256,8 @@ namespace strumpack {
         std::cerr << "# F-DEVUPDATE WARNING: uploaded values differ from the host array, "
           "re-uploading (stale host registration?)" << std::endl;
         I.reg_raw.unregister();
-        I.enqueue(I.raw_ptr, false);
+        I.redo(false);
         gpu_check(cudaStreamSynchronize(I.stream));
-        I.wb_pending = false;
         if (!I.verify())
           std::cerr << "# F-DEVUPDATE ERROR: device values could not be verified after re-upload; "
             "results may be wrong" << std::endl;
@@ -256,9 +268,9 @@ namespace strumpack {
       cudaGetLastError();
       if (I.verbose) {
         const double since = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - I.t_update).count();
-        const double gb = double(I.nnz_in) * sizeof(scalar_t) / 1e9;
+        const double gb = double(I.nnz_in) * I.raw_elem / 1e9;
         std::cout << "# F-DEVUPDATE gen " << I.gen << " host_update_ms " << I.host_ms
-                  << " pinned " << (I.pinned_last ? 1 : 0)
+                  << " pinned " << (I.pinned_last ? 1 : 0) << " raw_elem_bytes " << I.raw_elem
                   << " copy_ms " << copy_ms << " (" << gb / (copy_ms * 1e-3) << " GB/s, " << gb << " GB, "
                   << I.nchunks << " chunks) gather_ms " << gather_ms
                   << " factor_wait_ms " << wait_ms << " update_to_factor_ms " << since << std::endl;
@@ -268,7 +280,21 @@ namespace strumpack {
     }
 
     template<typename scalar_t, typename integer_t> void
-    DeviceValueUpdater<scalar_t,integer_t>::release_device_values() {
+    DeviceValueUpdater<scalar_t,integer_t>::factor_enqueued() {
+      auto& I = *impl_;
+      if (!I.writeback || !I.current || !I.host_vals) return;
+      // after the factorization work (legacy default stream order), refresh the host values; this overlaps the
+      // factorization kernels and is waited for only by host consumers of the values (sync_host_values)
+      gpu_check(cudaEventRecord(I.e_order, 0));
+      gpu_check(cudaStreamWaitEvent(I.stream, I.e_order, 0));
+      gpu_check(cudaMemcpyAsync(I.host_vals, I.d_out.template as<scalar_t>(), I.nnz*sizeof(scalar_t),
+                                cudaMemcpyDeviceToHost, I.stream));
+      gpu_check(cudaEventRecord(I.e_wb, I.stream));
+      I.wb_pending = true;
+    }
+
+    template<typename scalar_t, typename integer_t> void
+    DeviceValueUpdater<scalar_t,integer_t>::sync_host_values() {
       auto& I = *impl_;
       if (I.wb_pending) {
         gpu_check(cudaEventSynchronize(I.e_wb));
@@ -276,18 +302,21 @@ namespace strumpack {
       }
     }
 
-    template class DeviceValueUpdater<float,int>;
-    template class DeviceValueUpdater<double,int>;
-    template class DeviceValueUpdater<std::complex<float>,int>;
-    template class DeviceValueUpdater<std::complex<double>,int>;
-    template class DeviceValueUpdater<float,long>;
-    template class DeviceValueUpdater<double,long>;
-    template class DeviceValueUpdater<std::complex<float>,long>;
-    template class DeviceValueUpdater<std::complex<double>,long>;
-    template class DeviceValueUpdater<float,long long>;
-    template class DeviceValueUpdater<double,long long>;
-    template class DeviceValueUpdater<std::complex<float>,long long>;
-    template class DeviceValueUpdater<std::complex<double>,long long>;
+#define DEVUPD_INST(S, I)                                                \
+    template class DeviceValueUpdater<S,I>;
+#define DEVUPD_INST_FROM(S, F, I)                                       \
+    template bool DeviceValueUpdater<S,I>::update_from<F>(const F*, std::size_t);
+#define DEVUPD_INST_ALL(I)                                               \
+    DEVUPD_INST(float, I) DEVUPD_INST(double, I)                         \
+    DEVUPD_INST(std::complex<float>, I) DEVUPD_INST(std::complex<double>, I) \
+    DEVUPD_INST_FROM(float, float, I) DEVUPD_INST_FROM(double, double, I) \
+    DEVUPD_INST_FROM(std::complex<float>, std::complex<float>, I)        \
+    DEVUPD_INST_FROM(std::complex<double>, std::complex<double>, I)      \
+    DEVUPD_INST_FROM(float, double, I)                                   \
+    DEVUPD_INST_FROM(std::complex<float>, std::complex<double>, I)
+    DEVUPD_INST_ALL(int)
+    DEVUPD_INST_ALL(long)
+    DEVUPD_INST_ALL(long long)
 
   } // end namespace gpu
 } // end namespace strumpack

@@ -262,21 +262,11 @@ namespace strumpack {
     // index-valued matrix and reused while the input structure (N, nnz, ptr, ind) is unchanged.
     // STRUM_UPDATE_CACHE=0 disables it.
     bool update_values_cached(integer_t N, const integer_t* ptr, const integer_t* ind, const scalar_t* val);
+    // same, with the cast src_t -> scalar_t folded into the gather (host) or done in the device gather kernel
     template<typename src_t>
-    bool update_values_cached_from(integer_t N, const integer_t* ptr, const integer_t* ind, const src_t* val) {
-      if (!upd_valid_ || !this->reordered_ || N != upd_N_ || ptr[N] != upd_ptr_[N]) return false;
-      if (!std::equal(upd_ptr_.begin(), upd_ptr_.end(), ptr) ||
-          !std::equal(upd_ind_.begin(), upd_ind_.end(), ind)) { upd_valid_ = false; return false; }
-      const std::size_t nnz = mat_->nnz();
-      auto v = mat_->val();
-      const auto map = upd_map_.data();
-#pragma omp parallel for
-      for (std::size_t k=0; k<nnz; k++)
-        v[k] = map[k] > 0 ? scalar_t(val[map[k]-1]) : scalar_t(0.);
-      host_values_updated();
-      this->factored_ = false;
-      return true;
-    }
+    bool update_values_cached_from(integer_t N, const integer_t* ptr, const integer_t* ind, const src_t* val);
+    // the cached map applies: same N / nnz / ptr / ind as when it was built (STRUM_UPDATE_CHECK=0 skips the ind compare)
+    bool update_cache_structure_ok(integer_t N, const integer_t* ptr, const integer_t* ind);
     // F-DEVUPDATE: the device-side update (sparse/fronts/DeviceValueUpdate.hpp); the matrix' host values are
     // then refreshed asynchronously and the factorization takes the values from the device
     void host_values_updated();   // host path wrote mat_->val(): the device copy is stale

@@ -543,8 +543,18 @@ namespace strumpack {
     ReturnCode err_code = ReturnCode::SUCCESS;
     static const bool pack_verbose = std::getenv("STRUM_DEVUPDATE_VERBOSE") && std::atoi(std::getenv("STRUM_DEVUPDATE_VERBOSE")) != 0;
     const auto t_f0 = std::chrono::steady_clock::now();
-    solve_cache_.reset(); // new factors: rebuild the solve workspace
-    devperm_.reset();     // S-HOST: and the device permutation
+    static const bool keep_solve_cache = !(std::getenv("STRUM_SOLVE_CACHE_KEEP") &&
+                                           std::atoi(std::getenv("STRUM_SOLVE_CACHE_KEEP")) == 0);
+    if (keep_solve_cache && solve_cache_) {
+      // S-CACHE-KEEP (magma-hpc F track): same structure and the same persistent factor memory, so the solve
+      // workspace, its meta-data and the device permutation stay valid; only the per-front pivot permutations
+      // are rebuilt at the next solve. This also removes the cudaFree/cudaFreeHost here, whose implicit device
+      // synchronization would wait for the asynchronous value upload of F-DEVUPDATE.
+      solve_cache_->perm_ready = false;
+    } else {
+      solve_cache_.reset(); // new factors: rebuild the solve workspace
+      devperm_.reset();     // S-HOST: and the device permutation
+    }
     const auto t_f1 = std::chrono::steady_clock::now();
     auto& C = *factor_cache_;
     gpu::Stream comp_stream;
@@ -686,7 +696,16 @@ namespace strumpack {
       STRUMPACK_FULL_RANK_FLOPS(level_flops);
       STRUMPACK_FLOPS(small_flops);
     }
-    if (dsrc) dsrc->release_device_values();   // F-DEVUPDATE: host write-back done (overlapped the kernels above)
+    {
+      // the solve's (blocking) stream and the F-DEVUPDATE write-back must follow the factorization work issued
+      // on comp_stream: an event wait on the legacy default stream is a barrier for every blocking stream
+      cudaEvent_t ev;
+      gpu_check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+      gpu_check(cudaEventRecord(ev, gpu::get_cuda_stream(comp_stream)));
+      gpu_check(cudaStreamWaitEvent(0, ev, 0));
+      gpu_check(cudaEventDestroy(ev));
+    }
+    if (dsrc) dsrc->factor_enqueued();   // F-DEVUPDATE: host write-back now, overlapping the kernels above
     return err_code;
   }
 
@@ -1497,10 +1516,17 @@ namespace strumpack {
         ldata[l].set_batch_data(C.d_meta.template as<char>() + meta_off[l]);
         C.n_meta_uploads++;
       }
-      // S-LASWP: build the per-front permutations from the pivots (once per factorization / cache)
-      static const bool solve_perm = !(std::getenv("STRUM_SOLVE_PERM") && std::atoi(std::getenv("STRUM_SOLVE_PERM")) == 0);
-      C.perm_ready = false;
-      if (solve_perm) {
+      if (pack_verbose)
+        std::cout << "# F-PACK solve_cache_build_ms "
+                  << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_s0).count()
+                  << " (level info + meta-data + uploads; once per structure with S-CACHE-KEEP)" << std::endl;
+    }
+    // S-LASWP: build the per-front permutations from the pivots (once per factorization: the factorization
+    // clears perm_ready; S-CACHE-KEEP keeps the rest of this cache)
+    static const bool solve_perm = !(std::getenv("STRUM_SOLVE_PERM") && std::atoi(std::getenv("STRUM_SOLVE_PERM")) == 0);
+    if (solve_perm && !C.perm_ready) {
+      const auto t_p0 = std::chrono::steady_clock::now();
+      if (!C.d_perm.size()) {
         std::size_t tot = 0;
         for (int l=0; l<lvls; l++) tot += ldata[l].piv_size;
         C.d_perm = gpu::DeviceMemory<int>(tot + 1);
@@ -1515,16 +1541,15 @@ namespace strumpack {
           for (std::size_t i=0; i<L.f.size(); i++) { hp[l_off[l]+i] = base + off; off += L.f[i]->dim_sep(); }
         }
         gpu::copy_host_to_device<int*>(C.d_perm_ptrs, hp.data(), Ntotal + 1);
-        for (int l=lvls-1; l>=0; l--) {
-          auto& L = ldata[l];
-          if (L.Nsmall) gpu::ipiv_to_perm_vbatched(handle, L.dev_ipiv_batch, L.dev_d1_batch, C.perm_batch[l], L.Nsmall);
-        }
-        C.perm_ready = true;
       }
+      for (int l=lvls-1; l>=0; l--) {
+        auto& L = ldata[l];
+        if (L.Nsmall) gpu::ipiv_to_perm_vbatched(handle, L.dev_ipiv_batch, L.dev_d1_batch, C.perm_batch[l], L.Nsmall);
+      }
+      C.perm_ready = true;
       if (pack_verbose)
-        std::cout << "# F-PACK solve_cache_build_ms "
-                  << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_s0).count()
-                  << " (level info + meta-data + uploads + pivot permutations, once per factorization)" << std::endl;
+        std::cout << "# F-PACK solve_perm_rebuild_ms "
+                  << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_p0).count() << std::endl;
     }
     C.n_solves++;
     // copy rhs, from pageable memory (input)

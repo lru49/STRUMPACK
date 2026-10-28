@@ -16,11 +16,12 @@ namespace strumpack {
       return p < nnz_in ? p : nnz_in - 1;
     }
 
-    template<typename T, typename I> void
-    devupd_gather(std::size_t n, std::size_t nnz_in, const I* map, const T* raw, T* out, cudaStream_t s);
+    // out (T, nnz) = cast of raw (S, nnz_in) gathered through map; T == S or (float, double) / complex alike
+    template<typename T, typename S, typename I> void
+    devupd_gather(std::size_t n, std::size_t nnz_in, const I* map, const S* raw, T* out, cudaStream_t s);
 
-    template<typename T> void
-    devupd_sample(int ns, std::size_t nnz_in, const T* raw, T* samp, cudaStream_t s);
+    template<typename S> void
+    devupd_sample(int ns, std::size_t nnz_in, const S* raw, S* samp, cudaStream_t s);
 
   } // end namespace gpu
 } // end namespace strumpack

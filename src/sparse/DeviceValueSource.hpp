@@ -30,10 +30,13 @@ namespace strumpack {
     virtual const scalar_t*
     device_values(std::size_t nnz, unsigned long long* generation=nullptr) = 0;
     /**
-     * Called by the consumer when it is done issuing its work on the
-     * values (waits for the write-back of the host values).
+     * Called by the consumer once all its device work reading the
+     * values has been issued (in legacy-default-stream order): the
+     * provider may now refresh the host values (asynchronously).
      */
-    virtual void release_device_values() = 0;
+    virtual void factor_enqueued() = 0;
+    /** Block until the matrix' host val() array is current. */
+    virtual void sync_host_values() = 0;
   };
 
 } // end namespace strumpack

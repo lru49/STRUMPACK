@@ -78,7 +78,7 @@ namespace strumpack {
         DenseMatrixWrapper<refine_t> wx(x.rows(), 1, w, x.rows());
         solve_func(wx);
       };
-    auto spmv = [&](const refine_t* x, refine_t* y) { mat_.spmv(x, y); };
+    auto spmv = [&](const refine_t* x, refine_t* y) { outer().spmv(x, y); };
 
     auto old_verbose = solver_.options().verbose();
     solver_.options().set_verbose(false);
@@ -93,7 +93,7 @@ namespace strumpack {
            use_initial_guess, opts_.verbose());
       else
         iterative::IterativeRefinement<refine_t,integer_t>
-          (mat_, solve_func, x, b, opts_.rel_tol(), opts_.abs_tol(),
+          (outer(), solve_func, x, b, opts_.rel_tol(), opts_.abs_tol(),
            Krylov_its_, opts_.maxit(), use_initial_guess, opts_.verbose());
     }; break;
     case KrylovSolver::DIRECT: {
@@ -102,7 +102,7 @@ namespace strumpack {
     }; break;
     case KrylovSolver::REFINE: {
       iterative::IterativeRefinement<refine_t,integer_t>
-        (mat_, solve_func, x, b, opts_.rel_tol(), opts_.abs_tol(),
+        (outer(), solve_func, x, b, opts_.rel_tol(), opts_.abs_tol(),
          Krylov_its_, opts_.maxit(), use_initial_guess, opts_.verbose());
     }; break;
     case KrylovSolver::PREC_GMRES: {
@@ -134,7 +134,7 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> ReturnCode
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   solve(const refine_t* b, refine_t* x, bool use_initial_guess) {
-    auto N = mat_.size();
+    auto N = outer().size();
     auto B = ConstDenseMatrixWrapperPtr(N, 1, b, N);
     DenseMatrixWrapper<refine_t> X(N, 1, x, N);
     return solve(*B, X, use_initial_guess);
@@ -144,7 +144,7 @@ namespace strumpack {
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   solve(int nrhs, const refine_t* b, int ldb, refine_t* x, int ldx,
         bool use_initial_guess) {
-    auto N = mat_.size();
+    auto N = outer().size();
     auto B = ConstDenseMatrixWrapperPtr(N, nrhs, b, ldb);
     DenseMatrixWrapper<refine_t> X(N, nrhs, x, ldx);
     return solve(*B, X, use_initial_guess);
@@ -166,7 +166,7 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> ReturnCode
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   solve(const factor_t* b, factor_t* x, bool use_initial_guess) {
-    auto N = mat_.size();
+    auto N = outer().size();
     auto B = ConstDenseMatrixWrapperPtr(N, 1, b, N);
     DenseMatrixWrapper<factor_t> X(N, 1, x, N);
     return solve(*B, X, use_initial_guess);
@@ -176,7 +176,7 @@ namespace strumpack {
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   solve(int nrhs, const factor_t* b, int ldb, factor_t* x, int ldx,
         bool use_initial_guess) {
-    auto N = mat_.size();
+    auto N = outer().size();
     auto B = ConstDenseMatrixWrapperPtr(N, nrhs, b, ldb);
     DenseMatrixWrapper<factor_t> X(N, nrhs, x, ldx);
     return solve(*B, X, use_initial_guess);
@@ -197,6 +197,7 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> void
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   set_matrix(const CSRMatrix<refine_t,integer_t>& A) {
+    ext_mat_ = nullptr;
     mat_ = A;
     solver_.set_matrix(cast_matrix<refine_t,integer_t,factor_t>(A));
   }
@@ -204,6 +205,7 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> void
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   set_matrix(const CSRMatrix<factor_t,integer_t>& A) {
+    ext_mat_ = nullptr;
     mat_ = cast_matrix<factor_t,integer_t,refine_t>(A);
     solver_.set_matrix(A);
   }
@@ -211,6 +213,7 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> void
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   set_lower_triangle_matrix(const CSRMatrix<refine_t,integer_t>& A) {
+    ext_mat_ = nullptr;
     mat_ = A;
     solver_.set_lower_triangle_matrix(cast_matrix<refine_t,integer_t,factor_t>(A));
   }
@@ -218,6 +221,7 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> void
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   set_lower_triangle_matrix(const CSRMatrix<factor_t,integer_t>& A) {
+    ext_mat_ = nullptr;
     mat_ = cast_matrix<factor_t,integer_t,refine_t>(A);
     solver_.set_lower_triangle_matrix(A);
   }
@@ -228,16 +232,31 @@ namespace strumpack {
     // F-FP32-UPDATE: same structure -> copy only the values of the outer (refine_t) matrix and let the inner
     // solver gather+cast the new values through its update cache; otherwise the original full path.
     static const bool fast = !(std::getenv("STRUM_MP_UPDATE") && std::atoi(std::getenv("STRUM_MP_UPDATE")) == 0);
-    if (fast && mat_.size() == A.size() && mat_.nnz() == A.nnz() &&
-        std::equal(A.ptr(), A.ptr()+A.size()+1, mat_.ptr()) &&
-        std::equal(A.ind(), A.ind()+A.nnz(), mat_.ind())) {
+    static const bool alias = !(std::getenv("STRUM_MP_ALIAS") && std::atoi(std::getenv("STRUM_MP_ALIAS")) == 0);
+    static const bool full_check = !(std::getenv("STRUM_UPDATE_CHECK") && std::atoi(std::getenv("STRUM_UPDATE_CHECK")) == 0);
+    bool same = fast && mat_.size() == A.size() && mat_.nnz() == A.nnz() &&
+      std::equal(A.ptr(), A.ptr()+A.size()+1, mat_.ptr());
+    if (same && full_check) {   // parallel compare of the 2 x nnz column indices (mat_ keeps the structure even when aliased)
       const std::size_t nnz = A.nnz();
-      auto dst = mat_.val(); auto src = A.val();
+      const integer_t* i1 = A.ind(); const integer_t* i2 = mat_.ind();
+      bool diff = false;
+#pragma omp parallel for reduction(||:diff) schedule(static)
+      for (std::size_t k=0; k<nnz; k++) diff = diff || (i1[k] != i2[k]);
+      same = !diff;
+    }
+    if (same) {
+      if (alias) ext_mat_ = &A;   // F-DEVUPDATE/MP: no value copy; the caller's matrix is the refinement operator
+      else {
+        ext_mat_ = nullptr;
+        const std::size_t nnz = A.nnz();
+        auto dst = mat_.val(); auto src = A.val();
 #pragma omp parallel for
-      for (std::size_t k=0; k<nnz; k++) dst[k] = src[k];
+        for (std::size_t k=0; k<nnz; k++) dst[k] = src[k];
+      }
       solver_.template update_matrix_values_from<refine_t>(A);
       return;
     }
+    ext_mat_ = nullptr;
     mat_ = A;
     solver_.update_matrix_values(cast_matrix<refine_t,integer_t,factor_t>(A));
   }
@@ -245,6 +264,7 @@ namespace strumpack {
   template<typename factor_t,typename refine_t,typename integer_t> void
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
   update_matrix_values(const CSRMatrix<factor_t,integer_t>& A) {
+    ext_mat_ = nullptr;
     mat_ = cast_matrix<factor_t,integer_t,refine_t>(A);
     solver_.update_matrix_values(A);
   }

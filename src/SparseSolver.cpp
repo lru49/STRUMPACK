@@ -158,6 +158,12 @@ namespace strumpack {
   template<typename scalar_t,typename integer_t> bool
   SparseSolver<scalar_t,integer_t>::update_values_cached
   (integer_t N, const integer_t* ptr, const integer_t* ind, const scalar_t* val) {
+    return update_values_cached_from<scalar_t>(N, ptr, ind, val);
+  }
+
+  template<typename scalar_t,typename integer_t> bool
+  SparseSolver<scalar_t,integer_t>::update_cache_structure_ok
+  (integer_t N, const integer_t* ptr, const integer_t* ind) {
     if (!upd_valid_ || !reordered_ || N != upd_N_ ||
         ptr[N] != upd_ptr_[N]) return false;
     // structure check (STRUM_UPDATE_CHECK=0 skips the ind compare, 227 MB for the JOREK proxy, and
@@ -177,9 +183,16 @@ namespace strumpack {
       upd_valid_ = false;   // structure changed: rebuild through the full path
       return false;
     }
+    return true;
+  }
+
+  template<typename scalar_t,typename integer_t> template<typename src_t> bool
+  SparseSolver<scalar_t,integer_t>::update_values_cached_from
+  (integer_t N, const integer_t* ptr, const integer_t* ind, const src_t* val) {
+    if (!update_cache_structure_ok(N, ptr, ind)) return false;
 #if defined(STRUMPACK_USE_CUDA)
-    // F-DEVUPDATE: raw values -> device, gather there; returns before the copy is done
-    if (devupd_ && devupd_->update(val, std::size_t(ptr[N]))) {
+    // F-DEVUPDATE: raw values -> device, gather (+cast) there; returns before the copy is done
+    if (devupd_ && devupd_->template update_from<src_t>(val, std::size_t(ptr[N]))) {
       mat_->set_device_value_source(devupd_.get());
       factored_ = false;
       return true;
@@ -190,7 +203,7 @@ namespace strumpack {
     const auto map = upd_map_.data();
 #pragma omp parallel for
     for (std::size_t k=0; k<nnz; k++)
-      v[k] = map[k] > 0 ? val[map[k]-1] : scalar_t(0.);
+      v[k] = map[k] > 0 ? scalar_t(val[map[k]-1]) : scalar_t(0.);
     host_values_updated();
     factored_ = false;
     return true;
@@ -386,6 +399,10 @@ namespace strumpack {
       // should still continue!!
       if (ierr != ReturnCode::SUCCESS) return ierr;
     }
+#if defined(STRUMPACK_USE_CUDA)
+    // F-DEVUPDATE: the Krylov solvers / iterative refinement read the matrix values on the host
+    if (devupd_ && opts_.Krylov_solver() != KrylovSolver::DIRECT) devupd_->sync_host_values();
+#endif
 
     TaskTimer t("solve");
     this->perf_counters_start();
@@ -540,6 +557,14 @@ namespace strumpack {
   }
 
   // explicit template instantiations
+  // F-FP32-UPDATE / F-DEVUPDATE: value updates of the float solvers from double input
+  template bool SparseSolver<float,int>::update_values_cached_from<double>(int, const int*, const int*, const double*);
+  template bool SparseSolver<std::complex<float>,int>::update_values_cached_from<std::complex<double>>(int, const int*, const int*, const std::complex<double>*);
+  template bool SparseSolver<float,long int>::update_values_cached_from<double>(long int, const long int*, const long int*, const double*);
+  template bool SparseSolver<std::complex<float>,long int>::update_values_cached_from<std::complex<double>>(long int, const long int*, const long int*, const std::complex<double>*);
+  template bool SparseSolver<float,long long int>::update_values_cached_from<double>(long long int, const long long int*, const long long int*, const double*);
+  template bool SparseSolver<std::complex<float>,long long int>::update_values_cached_from<std::complex<double>>(long long int, const long long int*, const long long int*, const std::complex<double>*);
+
   template class SparseSolver<float,int>;
   template class SparseSolver<double,int>;
   template class SparseSolver<std::complex<float>,int>;
