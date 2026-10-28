@@ -469,6 +469,12 @@ namespace strumpack {
           int k1, int k2, int* ipiv, int inc);
 
     // assume inc = 1
+    // S-LASWP (CUDA backend only): pivot sequence -> permutation once, parallel gather per solve
+    void ipiv_to_perm_vbatched(Handle& handle, int** dipiv, int* npiv, int** dperm, unsigned int batchCount);
+    template<typename scalar_t> bool
+    permute_rows_fwd_vbatched(Handle& handle, int* dn, scalar_t** dA, int* lddA, int** dperm,
+                              int* npiv, int max_npiv, unsigned int batchCount);
+
     template<typename scalar_t> void
     laswp_fwd_vbatched(Handle& handle, int* dn, int max_n,
                        scalar_t** dA, int* lddA, int** dipiv, int* npivots,

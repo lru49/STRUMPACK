@@ -295,6 +295,11 @@ namespace strumpack {
     gpu::DeviceMemory<char> d_mem;
     gpu::HostMemory<char> h_mem;
     gpu::HostMemory<scalar_t> h_b;   // S-RHSPIN: pinned staging for the right-hand side / solution (rows x nrhs)
+    // S-LASWP: per-front row permutations of the forward solve (computed once per factorization)
+    gpu::DeviceMemory<int> d_perm;
+    gpu::DeviceMemory<int*> d_perm_ptrs;
+    std::vector<int**> perm_batch;
+    bool perm_ready = false;
     // Per-level batch meta-data (LevelInfoMAGMA::set_batch_data), one
     // private device region per level, so that it can be uploaded once
     // per cache instead of being re-uploaded (fwd + bwd) at every solve.
@@ -1415,6 +1420,30 @@ namespace strumpack {
         ldata[l].set_batch_data(C.d_meta.template as<char>() + meta_off[l]);
         C.n_meta_uploads++;
       }
+      // S-LASWP: build the per-front permutations from the pivots (once per factorization / cache)
+      static const bool solve_perm = !(std::getenv("STRUM_SOLVE_PERM") && std::atoi(std::getenv("STRUM_SOLVE_PERM")) == 0);
+      C.perm_ready = false;
+      if (solve_perm) {
+        std::size_t tot = 0;
+        for (int l=0; l<lvls; l++) tot += ldata[l].piv_size;
+        C.d_perm = gpu::DeviceMemory<int>(tot + 1);
+        C.d_perm_ptrs = gpu::DeviceMemory<int*>(Ntotal + 1);
+        std::vector<int*> hp(Ntotal + 1, nullptr);
+        C.perm_batch.assign(lvls, nullptr);
+        int* base = C.d_perm;
+        std::size_t off = 0;
+        for (int l=0; l<lvls; l++) {
+          auto& L = ldata[l];
+          C.perm_batch[l] = C.d_perm_ptrs.template as<int*>() + l_off[l];
+          for (std::size_t i=0; i<L.f.size(); i++) { hp[l_off[l]+i] = base + off; off += L.f[i]->dim_sep(); }
+        }
+        gpu::copy_host_to_device<int*>(C.d_perm_ptrs, hp.data(), Ntotal + 1);
+        for (int l=lvls-1; l>=0; l--) {
+          auto& L = ldata[l];
+          if (L.Nsmall) gpu::ipiv_to_perm_vbatched(handle, L.dev_ipiv_batch, L.dev_d1_batch, C.perm_batch[l], L.Nsmall);
+        }
+        C.perm_ready = true;
+      }
     }
     C.n_solves++;
     // copy rhs, from pageable memory (input)
@@ -1454,10 +1483,14 @@ namespace strumpack {
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
       // TODO remove?
       if (solve_sync) gpu::synchronize_default_stream();
-      gpu::laswp_fwd_vbatched
-        (handle, nrhs_batch+Nmax-Nsmall, nrhs,
-         d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
-         L.dev_ipiv_batch, d1, Nsmall);
+      if (!(C.perm_ready && Nsmall &&
+            gpu::permute_rows_fwd_vbatched<scalar_t>
+            (handle, nrhs_batch+Nmax-Nsmall, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
+             C.perm_batch[l], d1, L.max_d1_small, Nsmall)))
+        gpu::laswp_fwd_vbatched
+          (handle, nrhs_batch+Nmax-Nsmall, nrhs,
+           d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
+           L.dev_ipiv_batch, d1, Nsmall);
       gpu::magma::trsm_vbatched_max_nocheck
         (MagmaLeft, MagmaLower, MagmaNoTrans, MagmaUnit,
          L.max_d1_small, nrhs, d1, nrhs_batch+Nmax-Nsmall, scalar_t(1.),

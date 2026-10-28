@@ -90,6 +90,68 @@ namespace strumpack {
       }
     }
 
+    // S-LASWP (magma-hpc, 2026-10-27): the solve's row interchanges as a parallel gather. laswp_vbatch_kernel runs ONE
+    // thread per (front, column) through up to dim_sep dependent swaps (3200 for the root front, ~1.1 ms per solve
+    // with nrhs = 1). The pivot sequence of every front is turned into a permutation once per factorization
+    // (ipiv_to_perm), then each solve applies it with one block per front: stage the column in shared memory and
+    // write x[i] = s[perm[i]]. Bitwise the same values as the swap sequence.
+    __global__ void ipiv_to_perm_kernel(int** dipiv, int* npiv, int** dperm, unsigned int batchCount) {
+      unsigned int f = blockIdx.x * blockDim.x + threadIdx.x;
+      if (f >= batchCount) return;
+      const int n = npiv[f]; const int* P = dipiv[f]; int* perm = dperm[f];
+      for (int i=0; i<n; i++) perm[i] = i;
+      for (int i=0; i<n; i++) {
+        const int p = P[i] - 1;
+        if (p != i) { const int t = perm[i]; perm[i] = perm[p]; perm[p] = t; }
+      }
+    }
+    void ipiv_to_perm_vbatched(Handle& handle, int** dipiv, int* npiv, int** dperm, unsigned int batchCount) {
+      if (!batchCount) return;
+      cudaStream_t streamId;
+      cublasGetStream(get_cublas_handle(handle), &streamId);
+      const unsigned int nt = 128, nb = (batchCount + nt - 1) / nt;
+      ipiv_to_perm_kernel<<<nb, nt, 0, streamId>>>(dipiv, npiv, dperm, batchCount);
+      gpu_check(cudaPeekAtLastError());
+    }
+    template<typename T> __global__ void
+    permute_rows_kernel(int* dn, T** dA, int* lddA, int** dperm, int* npiv, unsigned int batchCount) {
+      extern __shared__ char smem_raw[];
+      T* s = reinterpret_cast<T*>(smem_raw);
+      const unsigned int f = blockIdx.y;
+      if (f >= batchCount) return;
+      const int n = npiv[f], ncol = dn[f], ld = lddA[f];
+      T* A = dA[f]; const int* perm = dperm[f];
+      for (int c=0; c<ncol; c++) {
+        T* col = A + std::size_t(c) * ld;
+        for (int i=threadIdx.x; i<n; i+=blockDim.x) s[i] = col[i];
+        __syncthreads();
+        for (int i=threadIdx.x; i<n; i+=blockDim.x) col[i] = s[perm[i]];
+        __syncthreads();
+      }
+    }
+    template<typename scalar_t> bool
+    permute_rows_fwd_vbatched(Handle& handle, int* dn, scalar_t** dA, int* lddA, int** dperm,
+                              int* npiv, int max_npiv, unsigned int batchCount) {
+      if (!batchCount || max_npiv <= 0) return true;
+      using T_ = typename cuda_type<scalar_t>::value_type;
+      const std::size_t smem = std::size_t(max_npiv) * sizeof(T_);
+      if (smem > 48 * 1024) return false;   // caller falls back to the swap kernel
+      cudaStream_t streamId;
+      cublasGetStream(get_cublas_handle(handle), &streamId);
+      unsigned int nt = 32; while (nt < (unsigned int)max_npiv && nt < 1024) nt *= 2;
+      for (unsigned int f=0; f<batchCount; f+=MAX_BLOCKS_Y) {
+        dim3 grid(1, std::min(batchCount-f, (unsigned int)MAX_BLOCKS_Y));
+        permute_rows_kernel<T_><<<grid, nt, smem, streamId>>>
+          (dn+f, reinterpret_cast<T_**>(dA)+f, lddA+f, dperm+f, npiv+f, batchCount-f);
+        gpu_check(cudaPeekAtLastError());
+      }
+      return true;
+    }
+    template bool permute_rows_fwd_vbatched(Handle&, int*, float**, int*, int**, int*, int, unsigned int);
+    template bool permute_rows_fwd_vbatched(Handle&, int*, double**, int*, int**, int*, int, unsigned int);
+    template bool permute_rows_fwd_vbatched(Handle&, int*, std::complex<float>**, int*, int**, int*, int, unsigned int);
+    template bool permute_rows_fwd_vbatched(Handle&, int*, std::complex<double>**, int*, int**, int*, int, unsigned int);
+
     template<typename scalar_t> void
     laswp_fwd_vbatched(Handle& handle, int* dn, int max_n,
                        scalar_t** dA, int* lddA, int** dipiv, int* npivots,
