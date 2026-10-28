@@ -480,6 +480,11 @@ namespace strumpack {
                        scalar_t** dA, int* lddA, int** dipiv, int* npivots,
                        unsigned int batchCount);
 
+    // S-HOST (CUDA backend only): dst(i,j) = src(perm[i],j) for an n x nrhs column-major block with ld = n,
+    // on the stream of handle (the sparse reordering applied to the rhs / solution on the device)
+    template<typename scalar_t> void
+    gather_rows(Handle& handle, int n, int nrhs, const scalar_t* src, scalar_t* dst, const int* perm);
+
 #endif // STRUMPACK_USE_GPU
 
   } // end namespace gpu

@@ -65,6 +65,11 @@ namespace strumpack {
 
     virtual void multifrontal_solve(DenseM_t& x) const;
 
+    // S-HOST: see Front::multifrontal_solve_devperm (forwarded to the root front)
+    virtual bool multifrontal_solve_devperm(const DenseM_t& b, DenseM_t& x,
+                                            const std::vector<integer_t>& iperm,
+                                            const std::vector<integer_t>& perm) const;
+
     virtual void
     multifrontal_solve_dist(DenseM_t& x,
                             const std::vector<integer_t>& dist) {} // TODO const

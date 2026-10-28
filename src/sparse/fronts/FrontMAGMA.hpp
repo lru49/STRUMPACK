@@ -74,6 +74,9 @@ namespace strumpack {
                       int etree_level=0, int task_depth=0) override;
 
     void multifrontal_solve(DenseM_t& b) const override;
+    bool multifrontal_solve_devperm(const DenseM_t& b, DenseM_t& x,
+                                    const std::vector<integer_t>& iperm,
+                                    const std::vector<integer_t>& perm) const override;
 
     void extract_CB_sub_matrix(const std::vector<std::size_t>& I,
                                const std::vector<std::size_t>& J,
@@ -139,7 +142,12 @@ namespace strumpack {
     void bwd_solve_phase1(DenseM_t& y, DenseM_t& yupd,
                           int etree_level, int task_depth) const override;
 
-    void gpu_solve(DenseM_t& b) const;
+    // S-HOST: when dp is set, b is the OUTPUT (solution) matrix and dp->braw the raw right-hand side; the
+    // reordering (dp->d_iperm) is applied on the device before the solve, its inverse (dp->d_perm) after
+    struct DevPermArgs { const DenseM_t* braw; const int* d_iperm; const int* d_perm; };
+    void gpu_solve(DenseM_t& b, const DevPermArgs* dp=nullptr) const;
+    struct DevPerm;   // S-HOST: cached device copy of the reordering permutation (iperm, perm)
+    mutable std::unique_ptr<DevPerm> devperm_;
 
     // solve workspace (stream, handle, level info, device/pinned
     // buffers and metadata), built on the first solve and reused while
