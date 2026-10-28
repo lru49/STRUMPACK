@@ -133,16 +133,15 @@ namespace strumpack {
     permute_rows_fwd_vbatched(Handle& handle, int* dn, scalar_t** dA, int* lddA, int** dperm,
                               int* npiv, int max_npiv, unsigned int batchCount) {
       if (!batchCount || max_npiv <= 0) return true;
-      using T_ = typename cuda_type<scalar_t>::value_type;
-      const std::size_t smem = std::size_t(max_npiv) * sizeof(T_);
+      const std::size_t smem = std::size_t(max_npiv) * sizeof(scalar_t);
       if (smem > 48 * 1024) return false;   // caller falls back to the swap kernel
       cudaStream_t streamId;
       cublasGetStream(get_cublas_handle(handle), &streamId);
       unsigned int nt = 32; while (nt < (unsigned int)max_npiv && nt < 1024) nt *= 2;
       for (unsigned int f=0; f<batchCount; f+=MAX_BLOCKS_Y) {
         dim3 grid(1, std::min(batchCount-f, (unsigned int)MAX_BLOCKS_Y));
-        permute_rows_kernel<T_><<<grid, nt, smem, streamId>>>
-          (dn+f, reinterpret_cast<T_**>(dA)+f, lddA+f, dperm+f, npiv+f, batchCount-f);
+        permute_rows_kernel<scalar_t><<<grid, nt, smem, streamId>>>
+          (dn+f, dA+f, lddA+f, dperm+f, npiv+f, batchCount-f);
         gpu_check(cudaPeekAtLastError());
       }
       return true;
