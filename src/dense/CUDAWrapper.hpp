@@ -61,6 +61,7 @@ namespace strumpack {
     }
     void cuda_assert(cudaError_t code, const char *file, int line,
                      bool abort=true);
+    void set_capture_tolerant(bool on);   // F-GRAPH, see CUDAWrapper.cpp
     void cuda_assert(cusolverStatus_t code, const char *file, int line,
                      bool abort=true);
     void cuda_assert(cublasStatus_t code, const char *file, int line,

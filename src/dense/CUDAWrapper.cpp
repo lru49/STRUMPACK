@@ -248,8 +248,31 @@ namespace strumpack {
       }
     }
 
+    // F-GRAPH: while a stream capture is in progress (set by the capturing code), errors of the
+    // cudaErrorStreamCapture* family are not fatal: the capture is already invalidated, the caller
+    // sees it at cudaStreamEndCapture and re-issues the sequence eagerly.
+    static int capture_tolerant_ = 0;
+    void set_capture_tolerant(bool on) { capture_tolerant_ = on ? 1 : 0; }
+    static bool capture_error(cudaError_t code) {
+      switch (code) {
+      case cudaErrorStreamCaptureUnsupported: case cudaErrorStreamCaptureInvalidated:
+      case cudaErrorStreamCaptureMerge: case cudaErrorStreamCaptureUnmatched:
+      case cudaErrorStreamCaptureUnjoined: case cudaErrorStreamCaptureIsolation:
+      case cudaErrorStreamCaptureImplicit: case cudaErrorCapturedEvent:
+      case cudaErrorStreamCaptureWrongThread: return true;
+      default: return false;
+      }
+    }
     void cuda_assert(cudaError_t code, const char *file, int line,
                      bool abrt) {
+      if (code != cudaSuccess && capture_tolerant_ && capture_error(code)) {
+        static int reported = 0;
+        if (reported++ < 3)
+          std::cerr << "# F-GRAPH: capture error (tolerated): " << cudaGetErrorString(code)
+                    << " " << file << " " << line << std::endl;
+        (void)cudaGetLastError();
+        return;
+      }
       if (code != cudaSuccess) {
         std::cerr << "CUDA assertion failed: "
                   << cudaGetErrorString(code) << " "

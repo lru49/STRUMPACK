@@ -131,12 +131,14 @@ namespace strumpack {
       (void)cudaGetLastError();
       return false;
     }
+    gpu::set_capture_tolerant(true);
     return true;
   }
   // ends the capture and instantiates; false (and nothing executed) if the capture was invalidated
   static bool graph_end(gpu::Stream& s, GraphExecHolder& G, const char* what) {
     cudaGraph_t g = nullptr;
     auto e = cudaStreamEndCapture(gpu::get_cuda_stream(s), &g);
+    gpu::set_capture_tolerant(false);
     if (e != cudaSuccess || !g) {
       std::cerr << "# F-GRAPH: capture of " << what << " failed: " << cudaGetErrorString(e)
                 << " (running the sequence eagerly)" << std::endl;
@@ -158,6 +160,15 @@ namespace strumpack {
     if (graph_log())
       std::cout << "# F-GRAPH " << what << " nodes " << G.nodes << " instantiate_ms " << G.instantiate_ms << std::endl;
     return true;
+  }
+  // STRUM_GRAPH_TRACE=1: report the capture status after each step (debugging aid)
+  static void graph_trace(const char* where, gpu::Stream& s) {
+    static const bool on = graph_env_int("STRUM_GRAPH_TRACE", 0) != 0;
+    if (!on) return;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    auto e = cudaStreamIsCapturing(gpu::get_cuda_stream(s), &st);
+    std::cout << "# F-GRAPH trace " << where << " status " << int(st) << " err " << int(e)
+              << " last " << int(cudaPeekAtLastError()) << std::endl;
   }
   static void graph_launch(GraphExecHolder& G, gpu::Stream& s) {
     gpu_check(cudaGraphLaunch(G.exec, gpu::get_cuda_stream(s)));
@@ -719,6 +730,7 @@ namespace strumpack {
             (C.map_off[l+1]-C.map_off[l], C.d_src + C.map_off[l],
              C.d_dst + C.map_off[l], C.d_vals, fbase, *gs);
           gpu::assemble(L.f.size(), C.h_asmbl[l], C.d_asmbl[l], *gs);
+          graph_trace("level:assemble", *gs);
         } else {
           gpu::memset<scalar_t>(C.level_work[l], 0, L.Schur_size);
           gpu::memset<scalar_t>(C.level_factors[l], 0, L.factor_size);
@@ -1730,7 +1742,9 @@ namespace strumpack {
     // F-GRAPH: with the rhs staged in the persistent pinned buffer, the whole device sequence (H2D, reorder,
     // forward, backward, reorder back, D2H) has invariant arguments: capture it once per solve cache, replay it.
     static const bool gsolve = graph_solve_on();
-    bool gcap = gsolve && (dp || rhs_pin);
+    // the first solve of a cache runs eagerly: MAGMA creates its workspace memory pools lazily on first use
+    // (cudaMemPoolCreate inside a capture invalidates it); the capture is taken from the second solve on
+    bool gcap = gsolve && (dp || rhs_pin) && C.n_solves > 1;
     // staging buffers (allocated outside any capture; their addresses are baked into the graph)
     if (dp || rhs_pin) { if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems); }
     if (dp) { if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems); }
@@ -1751,10 +1765,13 @@ namespace strumpack {
     auto issue_device = [&](bool on_stream) {
       if (dp) {
         gpu::copy_host_to_device_async<scalar_t>(d_braw, hb, nb_elems, C.comp_stream);
+        graph_trace("solve:h2d", C.comp_stream);
         gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_braw, d_b, dp->d_iperm);
-      } else if (rhs_pin)
+        graph_trace("solve:gather", C.comp_stream);
+      } else if (rhs_pin) {
         gpu::copy_host_to_device_async<scalar_t>(d_b, hb, nb_elems, C.comp_stream);
-      else
+        graph_trace("solve:h2d", C.comp_stream);
+      } else
         gpu::copy_host_to_device<scalar_t>(d_b, b);
       const bool sync = solve_sync && !on_stream;
       // forward solve
@@ -1781,6 +1798,7 @@ namespace strumpack {
         }
         // TODO remove?
         if (sync) gpu::synchronize_default_stream();
+        graph_trace("solve:fwd memset/extend_add", C.comp_stream);
         if (!(C.perm_ready && Nsmall &&
               gpu::permute_rows_fwd_vbatched<scalar_t>
               (handle, nrhs_batch+Nmax-Nsmall, d_rhs_batch[l], ldrhs_batch+Nmax-Nsmall,
@@ -1803,6 +1821,7 @@ namespace strumpack {
           DenseMW_t fb(L.f[i]->dim_sep(), nrhs, h_rhs_batch[l][i], b.rows());
           gpu::getrs(handle, Trans::N, L.f[i]->F11_, L.f[i]->piv_, fb, getrs_err);
         }
+        graph_trace("solve:fwd perm/trsm", C.comp_stream);
         if (l == 0) break;
         if (nrhs == 1)
           gpu::magma::gemv_vbatched_max_nocheck
