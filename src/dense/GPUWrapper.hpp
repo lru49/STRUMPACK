@@ -495,6 +495,33 @@ namespace strumpack {
     template<typename scalar_t> void
     gather_rows(Handle& handle, int n, int nrhs, const scalar_t* src, scalar_t* dst, const int* perm);
 
+    // S-GEMVBATCH (magma-hpc, 2026-10-28): level-wide work-balanced panel gemv of the nrhs = 1 multifrontal solve.
+    // One launch per level and side; CTA b handles rows [row0, row0 + R) of front f, items[2b] = f, items[2b+1] = row0.
+    // Per row the dot product over the n columns is summed in exactly MAGMA's gemvn_vbatched order for the level's
+    // shape (DIM_Y interleaved partials per column chunk of `chunk` columns, chunk sums added in order; `split` = the
+    // G-GEMV1 split-K reduce order), so the result is bitwise the vbatched gemv's; y = y - res.
+    // fwd (F21, y = the front's update vector): the epilogue performs the extend-add of the level into the parents
+    // (the last-arriving CTA of a parent scatters its left then its right child, fixed order, no atomics on data).
+    // bwd (F12, y = the front's solution block): the x vector is gathered from the global solution with the front's
+    // update indices (replaces extract_rhs).
+    template<typename T> struct GemvbArgs {
+      int nitems = 0, R = 0, Lt = 0, L = 0, DIM_Y = 1, chunk = 0, split = 0, nmax = 0;
+      const int* items = nullptr;
+      const int* m = nullptr; const int* n = nullptr; const int* ld = nullptr;   // per front
+      T* const* A = nullptr;             // per front: F21 (fwd) / F12 (bwd)
+      T* const* x = nullptr;             // fwd: the front's solution block (n entries)
+      T* const* y = nullptr;             // fwd: update vector (m, in/out); bwd: solution block (m, in/out)
+      const int* parent = nullptr;       // fwd, per front: index of the parent in the level above (-1: none)
+      int* counters = nullptr;           // fwd, per parent: arrived items (self-resetting)
+      const int* expected = nullptr;     // fwd, per parent: number of items of its children
+      const AssembleData<T>* pa = nullptr;   // fwd, per parent: b / bupd pointers, children's CB and index maps
+      const int* const* upd = nullptr;   // bwd, per front: global row indices of the update block
+      const T* xg = nullptr;             // bwd: the full solution vector
+    };
+    // returns false (nothing launched) for complex types
+    template<typename scalar_t> bool gemvb_fwd(Handle& handle, const GemvbArgs<scalar_t>& P);
+    template<typename scalar_t> bool gemvb_bwd(Handle& handle, const GemvbArgs<scalar_t>& P);
+
 #endif // STRUMPACK_USE_GPU
 
   } // end namespace gpu

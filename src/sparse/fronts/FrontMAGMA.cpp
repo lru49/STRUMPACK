@@ -39,6 +39,7 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <unordered_map>
 
 #include "FrontMAGMA.hpp"
 #include "FrontGPUKernels.hpp"
@@ -331,6 +332,13 @@ namespace strumpack {
     bool inv_synced = false;                 // this cache's stream has waited for the current factorization's inverses
     gpu::DeviceMemory<scalar_t> d_partial;   // fused step: N x 64 x NB partial sums
     gpu::DeviceMemory<int> d_counter;        // fused step: per-front arrival counters (self-resetting)
+    // S-GEMVBATCH (structure only, kept with the cache): per-level work-item plans of the fused panel gemvs
+    bool gemvb_on = false;
+    std::size_t bupd_elems = 0;              // update-buffer elements in d_mem: one buffer per level with gemvb, 2 x max otherwise
+    std::vector<std::size_t> bupd_off;
+    std::vector<gpu::GemvbArgs<scalar_t>> gemvb_f, gemvb_b;
+    gpu::DeviceMemory<int> gemvb_ints;
+    gpu::DeviceMemory<int*> gemvb_updp;
   };
 
   // S-INVDIAG (magma-hpc, 2026-10-27): the top-of-tree fronts (d1 of several hundred to a few thousand rows) solve
@@ -362,6 +370,65 @@ namespace strumpack {
     inline bool nvtx() { static const bool v = env_int("STRUM_SOLVE_NVTX", 0) != 0; return v; }
     inline bool prefetch() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_PREFETCH", 0) != 0; return v; }   // v2 trace: +0.14 ms with the single-CTA apply; re-measured with v2b
     struct Range { bool on; Range(const char* s) : on(nvtx()) { if (on) nvtxRangePushA(s); } ~Range() { if (on) nvtxRangePop(); } };
+  }
+
+  // S-GEMVBATCH (magma-hpc, 2026-10-28): the per-level F21 (forward) and F12 (backward) panel gemvs of the nrhs = 1
+  // solve, 3.7 of the 7.8 ms solve at 600-800 GB/s (ncu: fixed 512-row tiles, one CTA per front for F12, sub-wave
+  // grids on the top levels), plus the extend-add / extract kernels and memsets around them (0.3 ms, launch-bound).
+  // Replaced by one level-wide launch per side: CTAs own (front, row block) work items so large fronts get many
+  // CTAs and small fronts share waves; the forward epilogue performs the extend-add into the parents (last-arriving
+  // CTA per parent, left then right child in the original order) and the backward gathers its x vector straight
+  // from the global solution with the fronts' update indices (no extract). Per row the dot product is summed in
+  // exactly the order of MAGMA's gemvn_vbatched variant for the level's shape (incl. the G-GEMV1 split-K chunks), so
+  // the result is bitwise the previous path's. STRUM_SOLVE_GEMVB=0 restores the previous path (bitwise),
+  // STRUM_SOLVE_GEMVB_R overrides the rows per CTA, STRUM_GEMVB_VERBOSE=1 prints the per-level plans.
+  namespace gemvb {
+    inline int env_int(const char* n, int def) { const char* e = std::getenv(n); return e ? std::atoi(e) : def; }
+    inline bool enabled() { static const bool v = env_int("STRUM_SOLVE_GEMVB", 1) != 0; return v; }
+    inline int rows() { static const int v = env_int("STRUM_SOLVE_GEMVB_R", 0); return v; }
+    inline int verbose() { static const int v = env_int("STRUM_GEMVB_VERBOSE", 0); return v; }
+    // Summation order of magmablas_{s,d}gemv_vbatched_max_nocheck (fork work/magma-fact, G-GEMV1) for a NoTrans launch
+    // with the level's max_m / max_n / batch: the gemvn variant <DIM_X,DIM_Y,TILE> of the dispatch table and the
+    // split-K chunking of gemvn_split_count (512-thread <*,*,512> variants whose grid has fewer than 164 CTAs).
+    inline void magma_gemvn_order(bool is_float, int max_m, int max_n, int batch, int& DIM_Y, int& S, int& chunk) {
+      int DX = 128, DY = 1, TILE = 512;
+      auto set = [&](int x, int y, int t) { DX = x; DY = y; TILE = t; };
+      const bool small = std::max(max_m, max_n) <= 96, fat = max_m < max_n;
+      if (!is_float) {
+        if (small) {
+          if (fat) { if (max_m <= 16) set(16,8,256); else if (max_m <= 32) set(32,4,512); else if (max_m <= 64) set(64,4,512); else set(128,4,512); }
+          else { if (max_n <= 16) set(128,1,256); else if (max_n <= 64) set(128,2,512); else set(128,4,512); }
+        } else {
+          if (fat) { if (max_m <= 8) set(16,16,512); else if (max_m <= 16) set(16,8,64); else if (max_m <= 32) set(32,8,256); else set(128,4,512); }
+          else { if (max_m <= 256) set(256,1,512); else set(512,1,512); }
+        }
+      } else {
+        if (small) {
+          if (fat) { if (max_m <= 8) set(8,16,64); else if (max_m <= 16) set(16,8,256); else if (max_m <= 32) set(32,4,64); else if (max_m <= 64) set(64,4,128); else set(128,2,128); }
+          else { if (max_n <= 16) set(64,2,512); else set(64,4,128); }
+        } else {
+          if (fat) { if (max_m <= 16) set(16,16,512); else if (max_m <= 32) set(32,8,128); else if (max_m <= 64) set(64,8,512); else set(128,4,512); }
+          else { if (max_m <= 256) set(256,1,512); else set(512,1,512); }
+        }
+      }
+      DIM_Y = DY; S = 1; chunk = max_n;
+      if (DX * DY == 512 && TILE == 512) {
+        const long ctas = long((max_m + TILE - 1) / TILE) * batch;
+        if (ctas > 0 && ctas < 164) {
+          int sp = int((246 + ctas - 1) / ctas);
+          const int smax = max_n / 32;
+          if (sp > smax) sp = smax;
+          if (sp >= 2) { chunk = (max_n + sp - 1) / sp; S = (max_n + chunk - 1) / chunk; }
+        }
+      }
+    }
+    // CTA shape: R rows x Lt lane-threads (R * Lt <= 1024)
+    inline void shape(int max_m, int L, int Renv, int& R, int& Lt) {
+      if (L <= 8) { R = 128; Lt = L; } else { R = 64; Lt = std::min(L, 16); }
+      while (R > 32 && R / 2 >= max_m) R /= 2;
+      if (Renv >= 32) R = Renv;
+      while (R * Lt > 1024 && Lt > 1) Lt /= 2;
+    }
   }
 
   // S-HOST: device copy of the sparse reordering permutation, cached across solves. Rebuilt after every
@@ -1738,6 +1805,29 @@ namespace strumpack {
         max_bupd_size = std::max(max_bupd_size, L.total_upd_size*nrhs);
         max_work_mem = std::max(max_work_mem, L.work_bytes);
       }
+      // S-GEMVBATCH: decided here because the layout of the update buffers depends on it (one buffer per level:
+      // the fused extend-add writes the parents' buffer while the children's is still being read)
+      C.gemvb_on = gemvb::enabled() && nrhs == 1 && !is_complex<scalar_t>() && lvls >= 2;
+      for (int l=0; l<lvls && C.gemvb_on; l++) {
+        auto& L = ldata[l];
+        if (L.f.empty() || L.Nsmall != L.f.size() || L.f.size() > 65534) C.gemvb_on = false;
+        if ((std::size_t(std::max(L.max_d1_small, L.max_d2_small)) + 1024) * sizeof(scalar_t) > 48 * 1024) C.gemvb_on = false;
+      }
+      for (int l=lvls-1; l>=1 && C.gemvb_on; l--) {   // every front of level l must be a child of a front of level l-1
+        auto& L = ldata[l]; auto& Lp = ldata[l-1];
+        std::unordered_map<const F_t*, int> idx;
+        for (std::size_t i=0; i<L.f.size(); i++) idx[L.f[i]] = int(i);
+        std::vector<char> seen(L.f.size(), 0);
+        for (auto pf : Lp.f)
+          for (auto ch : {pf->lchild_.get(), pf->rchild_.get()})
+            if (ch) { auto it = idx.find(ch); if (it == idx.end()) C.gemvb_on = false; else seen[it->second] = 1; }
+        for (auto sn : seen) if (!sn) C.gemvb_on = false;
+      }
+      C.bupd_off.assign(lvls+1, 0);
+      for (int l=0; l<lvls; l++) C.bupd_off[l+1] = C.bupd_off[l] + ldata[l].total_upd_size*nrhs;
+      C.bupd_elems = C.gemvb_on ? C.bupd_off[lvls] : 2*max_bupd_size;
+      if (gemvb::verbose()) std::cout << "# GEMVB " << (C.gemvb_on ? "on" : "off") << " levels " << lvls << " nrhs " << nrhs
+                                      << " update_buffer_MB " << C.bupd_elems * sizeof(scalar_t) / 1e6 << std::endl;
     }
     std::size_t d_mem_bytes = 0;
     d_mem_bytes += gpu::round_up(Ntotal*sizeof(gpu::AssembleData<scalar_t>));
@@ -1746,7 +1836,7 @@ namespace strumpack {
     d_mem_bytes += gpu::round_up(2*Ntotal*sizeof(scalar_t*));
     auto h_mem_bytes = d_mem_bytes;
     d_mem_bytes += gpu::round_up(max_work_mem);
-    d_mem_bytes += gpu::round_up((nrhs*b.rows()+2*max_bupd_size)*sizeof(scalar_t));
+    d_mem_bytes += gpu::round_up((nrhs*b.rows()+C.bupd_elems)*sizeof(scalar_t));
     if (fresh) {
       C.d_mem = gpu::DeviceMemory<char>(d_mem_bytes);
       C.h_mem = gpu::HostMemory<char>(h_mem_bytes);
@@ -1800,7 +1890,7 @@ namespace strumpack {
         d_bupd_batch[l] = d_batch_ptrs + Ntotal + l_off[l];
         h_rhs_batch[l] = h_batch_ptrs + l_off[l];
         h_bupd_batch[l] = h_batch_ptrs + Ntotal + l_off[l];
-        auto bu = (l % 2) ? d_bupd_odd : d_bupd_even;
+        auto bu = C.gemvb_on ? d_bupd_odd + C.bupd_off[l] : ((l % 2) ? d_bupd_odd : d_bupd_even);
         auto& L = ldata[l];
         for (std::size_t i=0, pos=l_off[l]; i<L.f.size(); i++, pos++) {
           h_batch_ptrs[pos] = d_b + L.f[i]->sep_begin();
@@ -1854,6 +1944,96 @@ namespace strumpack {
       for (int l=lvls-1; l>=0; l--) {
         ldata[l].set_batch_data(C.d_meta.template as<char>() + meta_off[l]);
         C.n_meta_uploads++;
+      }
+      // S-GEMVBATCH: per-level work-item plans (structure only; the device arrays live as long as this cache)
+      if (C.gemvb_on) {
+        const bool is_float = std::is_same<scalar_t,float>::value;
+        const int Renv = gemvb::rows();
+        std::vector<int> ints;
+        auto push = [&](const std::vector<int>& v) { std::size_t o = ints.size(); ints.insert(ints.end(), v.begin(), v.end()); ints.push_back(0); return o; };
+        std::vector<std::size_t> upd_off(Ntotal, 0);   // bwd: global row indices of every front's update block
+        for (int l=0; l<lvls; l++)
+          for (std::size_t i=0; i<ldata[l].f.size(); i++) {
+            upd_off[l_off[l]+i] = ints.size();
+            for (auto g : ldata[l].f[i]->upd()) ints.push_back(int(g));
+          }
+        const std::size_t off_counters = ints.size();   // fwd: per front, arrivals of its children's items (self-resetting)
+        ints.insert(ints.end(), Ntotal + 1, 0);
+        std::vector<int> expected(Ntotal, 0);           // fwd: per front, number of items of its children
+        struct LevelOff { std::size_t items_f = 0, items_b = 0, parent = 0; };
+        std::vector<LevelOff> lo(lvls);
+        std::vector<gpu::GemvbArgs<scalar_t>> PF(lvls), PB(lvls);
+        std::size_t bytes_total = 0;
+        for (int l=lvls-1; l>=1; l--) {
+          auto& L = ldata[l]; auto& Lp = ldata[l-1];
+          const std::size_t N = L.f.size();
+          std::unordered_map<const F_t*, int> idx;
+          for (std::size_t i=0; i<N; i++) idx[L.f[i]] = int(i);
+          std::vector<int> parent(N, -1);
+          for (std::size_t i=0; i<Lp.f.size(); i++)
+            for (auto ch : {Lp.f[i]->lchild_.get(), Lp.f[i]->rchild_.get()})
+              if (ch) parent[idx.at(ch)] = int(i);
+          auto plan = [&](bool fwd, gpu::GemvbArgs<scalar_t>& P, std::vector<int>& items) {
+            const int max_m = fwd ? L.max_d2_small : L.max_d1_small, max_n = fwd ? L.max_d1_small : L.max_d2_small;
+            int DY = 1, S = 1, chunk = max_n;
+            gemvb::magma_gemvn_order(is_float, max_m, max_n, int(N), DY, S, chunk);
+            P.DIM_Y = DY; P.chunk = chunk; P.split = S > 1 ? 1 : 0; P.L = S * DY; P.nmax = max_n;
+            gemvb::shape(max_m, P.L, Renv, P.R, P.Lt);
+            items.clear();
+            for (std::size_t i=0; i<N; i++) {
+              const int m = fwd ? L.f[i]->dim_upd() : L.f[i]->dim_sep(), n = fwd ? L.f[i]->dim_sep() : L.f[i]->dim_upd();
+              if (m <= 0 || n <= 0) continue;   // MAGMA's gemv leaves y untouched for an empty shape
+              for (int r0=0; r0<m; r0+=P.R) { items.push_back(int(i)); items.push_back(r0); }
+            }
+            P.nitems = int(items.size() / 2);
+          };
+          std::vector<int> itf, itb;
+          plan(true, PF[l], itf);
+#if defined(STRUM_PLANT_GEMVB)
+          if (l == std::min(10, lvls - 1)) {   // PLANT gemvb-skip-rowblock: the last row block of the level's largest front is skipped
+            std::size_t big = 0;
+            for (std::size_t i=1; i<N; i++) if (L.f[i]->dim_upd() > L.f[big]->dim_upd()) big = i;
+            for (std::size_t k=itf.size(); k>=2; k-=2) if (itf[k-2] == int(big)) { itf.erase(itf.begin()+k-2, itf.begin()+k); break; }
+            PF[l].nitems = int(itf.size() / 2);
+            std::cout << "# PLANT gemvb-skip-rowblock level " << l << " front " << big << " d2 " << L.f[big]->dim_upd() << std::endl;
+          }
+#endif
+          for (std::size_t k=0; k<itf.size(); k+=2) expected[l_off[l-1] + parent[itf[k]]]++;
+          plan(false, PB[l], itb);
+          lo[l].items_f = push(itf); lo[l].items_b = push(itb); lo[l].parent = push(parent);
+          if (gemvb::verbose()) {
+            std::size_t bytes = 0;
+            for (std::size_t i=0; i<N; i++) bytes += std::size_t(L.f[i]->dim_sep()) * L.f[i]->dim_upd() * sizeof(scalar_t);
+            bytes_total += 2 * bytes;
+            std::cout << "# GEMVB level " << l << " fronts " << N << " max_d1 " << L.max_d1_small << " max_d2 " << L.max_d2_small
+                      << " panel_MB " << bytes / 1e6
+                      << " | fwd items " << PF[l].nitems << " R " << PF[l].R << " Lt " << PF[l].Lt << " L " << PF[l].L
+                      << " DIM_Y " << PF[l].DIM_Y << " chunk " << PF[l].chunk << " split " << PF[l].split
+                      << " | bwd items " << PB[l].nitems << " R " << PB[l].R << " Lt " << PB[l].Lt << " L " << PB[l].L
+                      << " DIM_Y " << PB[l].DIM_Y << " chunk " << PB[l].chunk << " split " << PB[l].split << std::endl;
+          }
+        }
+        const std::size_t off_expected = push(expected);
+        C.gemvb_ints = gpu::DeviceMemory<int>(ints.size());
+        gpu::copy_host_to_device<int>(C.gemvb_ints, ints.data(), ints.size());
+        int* di = C.gemvb_ints;
+        std::vector<int*> updp(Ntotal);
+        for (std::size_t k=0; k<Ntotal; k++) updp[k] = di + upd_off[k];
+        C.gemvb_updp = gpu::DeviceMemory<int*>(Ntotal + 1);
+        gpu::copy_host_to_device<int*>(C.gemvb_updp, updp.data(), Ntotal);
+        for (int l=lvls-1; l>=1; l--) {
+          auto& L = ldata[l];
+          const std::size_t N = L.Nsmall;
+          auto& F = PF[l]; auto& B = PB[l];
+          F.items = di + lo[l].items_f; F.m = L.dev_d2_batch; F.n = L.dev_d1_batch; F.ld = L.dev_ld2_batch;
+          F.A = L.dev_F_batch + 2*N; F.x = d_rhs_batch[l]; F.y = d_bupd_batch[l];
+          F.parent = di + lo[l].parent; F.counters = di + off_counters + l_off[l-1]; F.expected = di + off_expected + l_off[l-1];
+          F.pa = d_asmbl + l_off[l-1];
+          B.items = di + lo[l].items_b; B.m = L.dev_d1_batch; B.n = L.dev_d2_batch; B.ld = L.dev_ld1_batch;
+          B.A = L.dev_F_batch + N; B.y = d_rhs_batch[l]; B.upd = C.gemvb_updp.template as<int*>() + l_off[l]; B.xg = d_b;
+        }
+        C.gemvb_f = std::move(PF); C.gemvb_b = std::move(PB);
+        if (gemvb::verbose()) std::cout << "# GEMVB panels_total_MB " << bytes_total / 1e6 << " plan_ints " << ints.size() << std::endl;
       }
       // S-INVDIAG: per-step batch arrays of the block recurrence for the converted levels (nrhs == 1 only)
       C.inv.clear();
@@ -2019,6 +2199,7 @@ namespace strumpack {
     // restores them (A/B arm).
     static const bool solve_sync = std::getenv("STRUM_SOLVE_SYNC") && std::atoi(std::getenv("STRUM_SOLVE_SYNC")) == 1;
     // forward solve
+    if (C.gemvb_on) gpu::memset<scalar_t>(d_bupd_odd, 0, C.bupd_elems);   // S-GEMVBATCH: all levels' update buffers at once
     for (int l=lvls-1; l>=0; l--) {
       if (solve_sync) gpu::synchronize_default_stream();
       std::string rname = "fwd l=" + std::to_string(l);
@@ -2029,7 +2210,7 @@ namespace strumpack {
       auto d1 = L.dev_d1_batch;   auto d2 = L.dev_d2_batch;
       auto ld1 = L.dev_ld1_batch; auto ld2 = L.dev_ld2_batch;
       auto F11 = L.dev_F_batch;   auto F21 = F11 + 2*Nsmall;
-      {
+      if (!C.gemvb_on) {   // S-GEMVBATCH: the extend-add is fused into the children's F21 launch
       invdiag::Range rea("ea");
       gpu::memset<scalar_t>
         ((l % 2) ? d_bupd_odd : d_bupd_even, 0, L.total_upd_size*nrhs);
@@ -2131,7 +2312,9 @@ namespace strumpack {
       }
       if (l == 0) break;
       invdiag::Range rg("F21");
-      if (nrhs == 1)
+      if (C.gemvb_on)
+        gpu::gemvb_fwd<scalar_t>(handle, C.gemvb_f[l]);
+      else if (nrhs == 1)
         gpu::magma::gemv_vbatched_max_nocheck
           (MagmaNoTrans, d2, d1, scalar_t(-1.),
            F21, ld2, d_rhs_batch[l], inc_batch+Nmax-Nsmall, scalar_t(1.),
@@ -2169,7 +2352,9 @@ namespace strumpack {
       if (solve_sync) gpu::synchronize_default_stream();
       if (l != 0) {
         invdiag::Range rg("F12");
-        if (nrhs == 1)
+        if (C.gemvb_on)
+          gpu::gemvb_bwd<scalar_t>(handle, C.gemvb_b[l]);
+        else if (nrhs == 1)
           gpu::magma::gemv_vbatched_max_nocheck
             (MagmaNoTrans, d1, d2, scalar_t(-1.), F12, ld1,
              d_bupd_batch[l], inc_batch+Nmax-Nsmall, scalar_t(1.),
@@ -2193,7 +2378,7 @@ namespace strumpack {
         }
       }
       if (solve_sync) gpu::synchronize_default_stream();
-      if (l != lvls-1) {
+      if (l != lvls-1 && !C.gemvb_on) {   // S-GEMVBATCH: the backward gathers x from the global solution
         invdiag::Range rx("extract");
         gpu::extract_rhs
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
