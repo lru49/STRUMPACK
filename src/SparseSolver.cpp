@@ -339,6 +339,27 @@ namespace strumpack {
 
     integer_t d = b.cols();
     assert(matrix()->size() < std::numeric_limits<int>::max());
+
+    // S-HOST (magma-hpc, 2026-10-27): for the direct solve without matching and equilibration, transform_b
+    // (bloc(i) = b(iperm[i])) and transform_x (x(i) = y(perm[i])) are pure permutations of the rhs / solution.
+    // Let the GPU front do them on the device (gather kernels around the tree solve, device copy of the
+    // permutation cached across solves) and skip the bloc allocation, the two host passes and the x = bloc copy.
+    // Falls through to the host path when the tree cannot (CPU fronts, factors not on the device).
+    // STRUM_SOLVE_DEVPERM=0 restores the host path.
+    static const bool devperm = !(std::getenv("STRUM_SOLVE_DEVPERM") &&
+                                  std::atoi(std::getenv("STRUM_SOLVE_DEVPERM")) == 0);
+    if (devperm && opts_.Krylov_solver() == KrylovSolver::DIRECT &&
+        opts_.matching() == MatchingJob::NONE &&
+        equil_.type == EquilibrationType::NONE &&
+        tree()->multifrontal_solve_devperm
+        (b, x, reordering()->iperm(), reordering()->perm())) {
+      Krylov_its_ = 0;
+      t.stop();
+      this->perf_counters_stop("DIRECT/GMRES solve");
+      this->print_solve_stats(t);
+      return ReturnCode::SUCCESS;
+    }
+
     DenseM_t bloc(b.rows(), d);
 
     auto spmv = [&](const scalar_t* x, scalar_t* y)

@@ -151,6 +151,30 @@ namespace strumpack {
     template bool permute_rows_fwd_vbatched(Handle&, int*, std::complex<float>**, int*, int**, int*, int, unsigned int);
     template bool permute_rows_fwd_vbatched(Handle&, int*, std::complex<double>**, int*, int**, int*, int, unsigned int);
 
+    // S-HOST (magma-hpc, 2026-10-27): the sparse reordering applied to the right-hand side / solution on the device,
+    // dst(i,j) = src(perm[i],j) for an n x nrhs column-major block with ld = n (one thread per row). A pure gather:
+    // bitwise the values of the host loops in SparseSolver::transform_b / transform_x.
+    template<typename T> __global__ void
+    gather_rows_kernel(int n, int nrhs, const T* src, T* dst, const int* perm) {
+      const int i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i >= n) return;
+      const int p = perm[i];
+      for (int j=0; j<nrhs; j++) dst[i + std::size_t(j) * n] = src[p + std::size_t(j) * n];
+    }
+    template<typename scalar_t> void
+    gather_rows(Handle& handle, int n, int nrhs, const scalar_t* src, scalar_t* dst, const int* perm) {
+      if (n <= 0 || nrhs <= 0) return;
+      cudaStream_t streamId;
+      cublasGetStream(get_cublas_handle(handle), &streamId);
+      const unsigned int nt = 256, nb = (unsigned int)(n + nt - 1) / nt;
+      gather_rows_kernel<scalar_t><<<nb, nt, 0, streamId>>>(n, nrhs, src, dst, perm);
+      gpu_check(cudaPeekAtLastError());
+    }
+    template void gather_rows(Handle&, int, int, const float*, float*, const int*);
+    template void gather_rows(Handle&, int, int, const double*, double*, const int*);
+    template void gather_rows(Handle&, int, int, const std::complex<float>*, std::complex<float>*, const int*);
+    template void gather_rows(Handle&, int, int, const std::complex<double>*, std::complex<double>*, const int*);
+
     template<typename scalar_t> void
     laswp_fwd_vbatched(Handle& handle, int* dn, int max_n,
                        scalar_t** dA, int* lddA, int** dipiv, int* npivots,

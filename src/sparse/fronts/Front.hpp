@@ -124,6 +124,16 @@ namespace strumpack {
 
     virtual void multifrontal_solve(DenseM_t& b) const;
 
+    // S-HOST: solve with the RAW (unpermuted) right-hand side b, writing the solution into x; the front
+    // applies the sparse reordering (y(i) = b(iperm[i])) before the solve and its inverse (x(i) = y(perm[i]))
+    // after, on the device. Returns false when the front cannot do this (the caller then takes the host
+    // transform_b / transform_x path). Only FrontMAGMA with factors on the device implements it.
+    virtual bool multifrontal_solve_devperm(const DenseM_t& b, DenseM_t& x,
+                                            const std::vector<integer_t>& iperm,
+                                            const std::vector<integer_t>& perm) const {
+      return false;
+    }
+
     virtual void
     forward_multifrontal_solve(DenseM_t& b, DenseM_t* work,
                                int etree_level=0,

@@ -32,6 +32,8 @@
 #include <cuda_runtime_api.h>
 #endif
 #include <cstring>
+#include <limits>
+#include <type_traits>
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -295,6 +297,7 @@ namespace strumpack {
     gpu::DeviceMemory<char> d_mem;
     gpu::HostMemory<char> h_mem;
     gpu::HostMemory<scalar_t> h_b;   // S-RHSPIN: pinned staging for the right-hand side / solution (rows x nrhs)
+    gpu::DeviceMemory<scalar_t> d_braw;   // S-HOST: raw (unpermuted) rhs on the way in, permuted-back solution on the way out
     // S-LASWP: per-front row permutations of the forward solve (computed once per factorization)
     gpu::DeviceMemory<int> d_perm;
     gpu::DeviceMemory<int*> d_perm_ptrs;
@@ -309,6 +312,17 @@ namespace strumpack {
       d_rhs_batch, d_bupd_batch;
     // Counters for STRUM_LAUNCH2_LOG / STRUM_LAUNCH2_VERIFY.
     std::size_t n_solves = 0, n_meta_uploads = 0, n_mem_uploads = 0;
+  };
+
+  // S-HOST: device copy of the sparse reordering permutation, cached across solves. Rebuilt after every
+  // factorization (devperm_ is reset there; a changed reordering always implies a new factorization before the
+  // next solve) and whenever the host vectors move or change size.
+  template<typename scalar_t,typename integer_t>
+  struct FrontMAGMA<scalar_t,integer_t>::DevPerm {
+    const integer_t* key_iperm = nullptr;
+    const integer_t* key_perm = nullptr;
+    std::size_t n = 0;
+    gpu::DeviceMemory<int> d_iperm, d_perm;
   };
 
   // STRUM_LAUNCH2_LOG=1: print one line per solve telling whether the
@@ -527,6 +541,7 @@ namespace strumpack {
     }
     ReturnCode err_code = ReturnCode::SUCCESS;
     solve_cache_.reset(); // new factors: rebuild the solve workspace
+    devperm_.reset();     // S-HOST: and the device permutation
     auto& C = *factor_cache_;
     gpu::Stream comp_stream;
     gpu::Handle handle(comp_stream);
@@ -785,6 +800,7 @@ namespace strumpack {
     ReturnCode err_code = ReturnCode::SUCCESS;
     factor_cache_.reset();
     solve_cache_.reset(); // new factors: rebuild the solve workspace
+    devperm_.reset();     // S-HOST: and the device permutation
     int lvls = ldata.size();
     gpu::Stream comp_stream, copy_stream;
     gpu::Handle handle(comp_stream);
@@ -1234,6 +1250,38 @@ namespace strumpack {
     }
   }
 
+  template<typename scalar_t,typename integer_t> bool
+  FrontMAGMA<scalar_t,integer_t>::multifrontal_solve_devperm
+  (const DenseM_t& b, DenseM_t& x, const std::vector<integer_t>& iperm,
+   const std::vector<integer_t>& perm) const {
+    if (!dev_factors_) return false;
+    const std::size_t n = x.rows();
+    if (std::size_t(b.rows()) != n || b.cols() != x.cols() ||
+        iperm.size() != n || perm.size() != n ||
+        n > std::size_t(std::numeric_limits<int>::max())) return false;
+    if (!devperm_ || devperm_->key_iperm != iperm.data() ||
+        devperm_->key_perm != perm.data() || devperm_->n != n) {
+      devperm_.reset(new DevPerm());
+      auto& D = *devperm_;
+      D.key_iperm = iperm.data();  D.key_perm = perm.data();  D.n = n;
+      D.d_iperm = gpu::DeviceMemory<int>(n);
+      D.d_perm = gpu::DeviceMemory<int>(n);
+      if (std::is_same<integer_t,int>::value) {
+        gpu::copy_host_to_device<int>(D.d_iperm, reinterpret_cast<const int*>(iperm.data()), n);
+        gpu::copy_host_to_device<int>(D.d_perm, reinterpret_cast<const int*>(perm.data()), n);
+      } else {
+        std::vector<int> t(n);
+        for (std::size_t i=0; i<n; i++) t[i] = int(iperm[i]);
+        gpu::copy_host_to_device<int>(D.d_iperm, t.data(), n);
+        for (std::size_t i=0; i<n; i++) t[i] = int(perm[i]);
+        gpu::copy_host_to_device<int>(D.d_perm, t.data(), n);
+      }
+    }
+    DevPermArgs dp{&b, devperm_->d_iperm, devperm_->d_perm};
+    gpu_solve(x, &dp);
+    return true;
+  }
+
   template<typename scalar_t,typename integer_t> void
   FrontMAGMA<scalar_t,integer_t>::fwd_solve_phase2
   (DenseM_t& b, DenseM_t& bupd, int etree_level, int task_depth) const {
@@ -1269,7 +1317,7 @@ namespace strumpack {
   }
 
   template<typename scalar_t,typename integer_t> void
-  FrontMAGMA<scalar_t,integer_t>::gpu_solve(DenseM_t& b) const {
+  FrontMAGMA<scalar_t,integer_t>::gpu_solve(DenseM_t& b, const DevPermArgs* dp) const {
     int nrhs = b.cols();
     if (!solve_cache_ || solve_cache_->nrhs != nrhs ||
         solve_cache_->rows != std::size_t(b.rows()))
@@ -1452,7 +1500,19 @@ namespace strumpack {
     // the compute stream. STRUM_RHS_PIN=0 restores the pageable copies.
     static const bool rhs_pin = !(std::getenv("STRUM_RHS_PIN") && std::atoi(std::getenv("STRUM_RHS_PIN")) == 0);
     const std::size_t nb_elems = std::size_t(b.rows()) * nrhs;
-    if (rhs_pin) {
+    if (dp) {
+      // S-HOST (magma-hpc, 2026-10-27): the right-hand side arrives RAW; stage it pinned, upload it and apply the
+      // sparse reordering on the device, d_b(i,:) = braw(iperm[i],:), instead of the host pass in transform_b.
+      const DenseM_t& br = *dp->braw;
+      if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems);
+      if (C.d_braw.size() < nb_elems) C.d_braw = gpu::DeviceMemory<scalar_t>(nb_elems);
+      scalar_t* hb = C.h_b;
+      scalar_t* d_braw = C.d_braw;
+      if (br.ld() == br.rows()) std::copy(br.data(), br.data() + nb_elems, hb);
+      else for (int j=0; j<nrhs; j++) std::copy(br.ptr(0, j), br.ptr(0, j) + br.rows(), hb + std::size_t(j) * br.rows());
+      gpu::copy_host_to_device_async<scalar_t>(d_braw, hb, nb_elems, C.comp_stream);
+      gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_braw, d_b, dp->d_iperm);
+    } else if (rhs_pin) {
       if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems);
       scalar_t* hb = C.h_b;
       if (b.ld() == b.rows()) std::copy(b.data(), b.data() + nb_elems, hb);
@@ -1569,7 +1629,16 @@ namespace strumpack {
         gpu::extract_rhs
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
     }
-    if (rhs_pin) {
+    if (dp) {
+      // S-HOST: undo the reordering on the device, x(i,:) = y(perm[i],:), then download (replaces transform_x)
+      scalar_t* hb = C.h_b;
+      scalar_t* d_braw = C.d_braw;
+      gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, d_braw, dp->d_perm);
+      gpu::copy_device_to_host_async<scalar_t>(hb, d_braw, nb_elems, C.comp_stream);
+      C.comp_stream.synchronize();
+      if (b.ld() == b.rows()) std::copy(hb, hb + nb_elems, b.data());
+      else for (int j=0; j<nrhs; j++) std::copy(hb + std::size_t(j) * b.rows(), hb + std::size_t(j+1) * b.rows(), b.ptr(0, j));
+    } else if (rhs_pin) {
       scalar_t* hb = C.h_b;
       gpu::copy_device_to_host_async<scalar_t>(hb, d_b, nb_elems, C.comp_stream);
       C.comp_stream.synchronize();

@@ -165,6 +165,13 @@ namespace strumpack {
     root_->multifrontal_solve(x);
   }
 
+  template<typename scalar_t,typename integer_t> bool
+  EliminationTree<scalar_t,integer_t>::multifrontal_solve_devperm
+  (const DenseM_t& b, DenseM_t& x, const std::vector<integer_t>& iperm,
+   const std::vector<integer_t>& perm) const {
+    return root_->multifrontal_solve_devperm(b, x, iperm, perm);
+  }
+
   template<typename scalar_t,typename integer_t> integer_t
   EliminationTree<scalar_t,integer_t>::maximum_rank() const {
     integer_t max_rank;
