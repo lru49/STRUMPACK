@@ -390,10 +390,21 @@ namespace strumpack {
   };
 
 
+  // S-INVDIAG (window 121): the solve interleaves its stream with legacy-default-stream work (per-level memset,
+  // extend-add, extract); when the two map to different hardware queues every launch of the solve pays ~0.8 us
+  // more (nsys: 1.5 vs 0.7 us between queued kernels, +0.2 ms per solve), and whether they share a queue is
+  // round-robin luck at stream creation (per-epoch streams: jitter; S-CACHE-KEEP's kept stream: fixed for the run).
+  // Default: the solve runs entirely on the legacy default stream (one queue). STRUM_SOLVE_LEGACY_STREAM=0 = own stream.
+  static bool solve_legacy_stream() {
+    static const bool v = !(std::getenv("STRUM_SOLVE_LEGACY_STREAM") && std::atoi(std::getenv("STRUM_SOLVE_LEGACY_STREAM")) == 0);
+    return v;
+  }
   template<typename scalar_t,typename integer_t>
   struct FrontMAGMA<scalar_t,integer_t>::SolveCache {
     SolveCache(int nrhs, std::size_t rows)
-      : handle(comp_stream), nrhs(nrhs), rows(rows) {}
+      // F-GRAPH: the captured solve needs an own stream (the legacy default stream cannot be captured; all its ops
+      // are on that one stream anyway), eager mode keeps the window-121 legacy-stream default
+      : comp_stream((solve_legacy_stream() && !graph_solve_on()) ? 2 : 0), handle(comp_stream), nrhs(nrhs), rows(rows) {}
     gpu::Stream comp_stream;
     gpu::Handle handle;
     int nrhs;
@@ -475,6 +486,7 @@ namespace strumpack {
     inline bool use_U() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_U", 1) != 0; return v; }
     inline int verbose() { static const int v = env_int("STRUM_INVDIAG_VERBOSE", 0); return v; }
     inline bool own_stream() { static const bool v = env_int("STRUM_INVDIAG_STREAM", 1) != 0; return v; }   // v2: inversion on a second stream
+    inline bool nonblocking() { static const bool v = env_int("STRUM_INVDIAG_NONBLOCKING", 1) != 0; return v; }   // 0 = blocking: legacy-stream ops wait for it (overlap 93 % -> 31 %, window-121 probe)
     inline bool fused() { static const bool v = env_int("STRUM_SOLVE_INVDIAG_FUSED", 1) != 0; return v; }      // v2: one kernel per step
     inline int chunk() { static const int v = std::max(16, env_int("STRUM_SOLVE_INVDIAG_CHUNK", 64)); return v; }
     inline bool nvtx() { static const bool v = env_int("STRUM_SOLVE_NVTX", 0) != 0; return v; }
@@ -781,7 +793,7 @@ namespace strumpack {
     std::vector<std::unique_ptr<gpu::Event>> inv_ready, inv_done;
     std::vector<cudaEvent_t> inv_t0, inv_t1;   // verbose timing per level (on the inversion stream)
     std::vector<float> inv_level_ms;
-    FactorCache() : inv_stream(true), inv_handle(inv_stream) {}
+    FactorCache() : inv_stream(invdiag::nonblocking()), inv_handle(inv_stream) {}
     ~FactorCache() { for (auto e : inv_t0) if (e) cudaEventDestroy(e); for (auto e : inv_t1) if (e) cudaEventDestroy(e); }
     double inv_ms = 0.;                         // inversion time of the last factorization (verbose)
     double inv_resid = 0.;                      // max ||I - inv * block|| of the last factorization (verbose >= 2)
@@ -907,12 +919,14 @@ namespace strumpack {
       return !(large_lu > 0 && C.ldata[l].max_d1_small > large_lu);
     };
     C.inv_ms = 0.; C.inv_resid = 0.;
-    // S-INVDIAG v2: the previous factorization's inversions must be done before F11 is overwritten (the memsets /
-    // gathers below run on the legacy default stream, which is ordered after comp_stream). F-GRAPH: the inversion
-    // branch is joined inside each level's graph, so stream order already covers it (and those events were
-    // recorded inside a capture).
+    // S-INVDIAG v2: the previous factorization's inversions must be done before F11 is overwritten. Host-side event
+    // wait on purpose (normally long complete): a cudaStreamWaitEvent of a blocking stream on an event of the
+    // non-blocking inversion stream leaves that stream with ~2x the per-launch latency for its whole life when the
+    // two map to different hardware queues (nsys: 1.5 vs 0.7 us between queued kernels; with the solve stream kept
+    // across refactorizations by S-CACHE-KEEP this cost every solve +0.2 ms). F-GRAPH: the inversion branch is
+    // joined inside each level's graph (stream order covers it; those events were recorded inside a capture).
     if (!gs)
-      for (int l=0; l<int(C.inv.size()); l++) if (C.inv[l].on && C.inv_done[l]) C.inv_done[l]->wait(comp_stream);
+      for (int l=0; l<int(C.inv.size()); l++) if (C.inv[l].on && C.inv_done[l]) C.inv_done[l]->synchronize();
     // the GPU work of one level: zero, gather the sparse entries, extend-add, LU, laswp, trsm, Schur update
     auto run_level = [&](int l) {
       auto& L = C.ldata[l];
@@ -2432,14 +2446,17 @@ namespace strumpack {
                   << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_p0).count() << std::endl;
     }
     // S-INVDIAG: the inverses of THIS factorization must be complete before the solve's stream touches them (the
-    // inversion stream is non-blocking and S-CACHE-KEEP keeps this cache across refactorizations: per epoch)
+    // inversion stream is non-blocking and S-CACHE-KEEP keeps this cache across refactorizations: per epoch).
+    // Host-side wait (see factors_on_device): a cudaStreamWaitEvent here put the kept solve stream into a slow
+    // launch mode (+0.2 ms per solve, window 121). The root's inversion tail (~0.8 ms after the last factorization
+    // kernel) is normally complete when the first solve starts.
     // F-GRAPH: with factorization graphs the inversion branch is joined inside each level's graph and the
     // factorization synchronizes on return, so stream order covers it (the inv_done events were recorded inside
     // a capture and carry no external state)
     if (!C.inv_synced) {
       if (factor_cache_ && graph_mode() == 0)
         for (int l=0; l<int(factor_cache_->inv.size()); l++)
-          if (factor_cache_->inv[l].on && factor_cache_->inv_done[l]) factor_cache_->inv_done[l]->wait(C.comp_stream);
+          if (factor_cache_->inv[l].on && factor_cache_->inv_done[l]) factor_cache_->inv_done[l]->synchronize();
       C.inv_synced = true;
     }
     C.n_solves++;

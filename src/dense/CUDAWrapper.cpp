@@ -54,14 +54,20 @@ namespace strumpack {
     struct Stream::StreamImpl {
       StreamImpl() { gpu_check(cudaStreamCreate(&s_)); }
       explicit StreamImpl(bool nb) { gpu_check(cudaStreamCreateWithFlags(&s_, nb ? cudaStreamNonBlocking : cudaStreamDefault)); }
-      ~StreamImpl() { gpu_check(cudaStreamDestroy(s_)); }
+      explicit StreamImpl(int kind) {
+        if (kind == 2) { s_ = nullptr; owned_ = false; }
+        else gpu_check(cudaStreamCreateWithFlags(&s_, kind == 1 ? cudaStreamNonBlocking : cudaStreamDefault));
+      }
+      ~StreamImpl() { if (owned_) gpu_check(cudaStreamDestroy(s_)); }
       operator cudaStream_t&() { return s_; }
       operator const cudaStream_t&() const { return s_; }
       void synchronize() { gpu_check(cudaStreamSynchronize(s_)); }
       cudaStream_t s_;
+      bool owned_ = true;
     };
     Stream::Stream() { s_ = std::make_unique<StreamImpl>(); }
     Stream::Stream(bool non_blocking) { s_ = std::make_unique<StreamImpl>(non_blocking); }
+    Stream::Stream(int kind) { s_ = std::make_unique<StreamImpl>(kind); }
     Stream::~Stream() = default;
     void Stream::synchronize() { s_->synchronize(); }
 

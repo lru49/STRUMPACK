@@ -62,6 +62,7 @@ namespace strumpack {
     public:
       Stream();
       explicit Stream(bool non_blocking);   // S-INVDIAG: cudaStreamNonBlocking (no implicit sync with the legacy default stream)
+      explicit Stream(int kind);            // S-INVDIAG: 0 = blocking, 1 = non-blocking, 2 = the legacy default stream (not destroyed)
       ~Stream();
       void synchronize();
 
