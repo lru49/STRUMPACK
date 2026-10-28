@@ -443,8 +443,11 @@ namespace strumpack {
     // Counters for STRUM_LAUNCH2_LOG / STRUM_LAUNCH2_VERIFY.
     std::size_t n_solves = 0, n_meta_uploads = 0, n_mem_uploads = 0;
 #if defined(STRUMPACK_USE_CUDA)
-    GraphExecHolder graph;        // the whole solve (H2D of the staged rhs .. D2H of the solution)
-    const void* gkey[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};   // pointers the captured graph bakes in
+    // the whole solve (H2D of the staged rhs .. D2H of the solution); one graph per I/O mode (host staging /
+    // S2 device pointers), so a caller alternating between the two APIs does not re-capture at every switch
+    GraphExecHolder graph[2];
+    const void* gkey[2][7] = {{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr},
+                              {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}};
 #endif
     // S-INVDIAG: per converted level (nrhs == 1 only), per block step k the batch arrays of the block recurrence
     // (K*N entries each, step k at offset k*N): rows of block k (mL), columns of the L update (nLu) / U update (nUu),
@@ -2806,17 +2809,19 @@ namespace strumpack {
       // the pointers the captured solve bakes in (S2: the caller's device buffers too)
       const void* key[7] = { dp ? reinterpret_cast<const void*>(dev_io ? 2 : 1) : nullptr, dp ? dp->d_iperm : nullptr,
                              dp ? dp->d_perm : nullptr, hb, d_braw, nullptr, nullptr };   // dev_stage: caller buffers not baked in
-      if (C.graph.valid() && std::memcmp(key, C.gkey, sizeof(key)) != 0) C.graph.reset();
-      if (C.graph.valid()) graph_launch(C.graph, C.comp_stream);
+      const int gi = dev_io ? 1 : 0;
+      auto& G = C.graph[gi];
+      if (G.valid() && std::memcmp(key, C.gkey[gi], sizeof(key)) != 0) G.reset();
+      if (G.valid()) graph_launch(G, C.comp_stream);
       else {
         bool captured = graph_begin(C.comp_stream);
         if (captured) {
           issue_device(true);
-          captured = graph_end(C.comp_stream, C.graph, "solve");
+          captured = graph_end(C.comp_stream, G, dev_io ? "solve(device)" : "solve");
         }
         if (captured) {
-          std::memcpy(C.gkey, key, sizeof(key));
-          graph_launch(C.graph, C.comp_stream);
+          std::memcpy(C.gkey[gi], key, sizeof(key));
+          graph_launch(G, C.comp_stream);
         } else
           issue_device(false);
       }
