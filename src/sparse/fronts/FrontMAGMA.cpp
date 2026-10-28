@@ -876,6 +876,14 @@ namespace strumpack {
       if (!factor_done_) factor_done_.reset(new gpu::Event());
       factor_done_->record(comp_stream);
     }
+    if (gmode) {
+      // F-GRAPH: with 15 graph launches instead of ~20k kernel launches the host no longer runs at the GPU's
+      // pace (launch-queue backpressure made the eager path return with the GPU nearly done): wait here so that
+      // factor() keeps its "factors ready on return" timing semantics and the first solve does not absorb the
+      // factorization. STRUM_GRAPH_NOSYNC=1 returns asynchronously.
+      static const bool nosync = graph_env_int("STRUM_GRAPH_NOSYNC", 0) != 0;
+      if (!nosync) comp_stream.synchronize();
+    }
     return err_code;
   }
 
