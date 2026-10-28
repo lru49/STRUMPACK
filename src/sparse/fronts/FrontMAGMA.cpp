@@ -565,7 +565,7 @@ namespace strumpack {
       gpu::DeviceMemory<scalar_t> d_inv;    // [ L blocks | U blocks ], final layout: block k of front i at inv_i + k*nb*nb, ld nb
       gpu::DeviceMemory<int> d_ints;
       gpu::DeviceMemory<scalar_t*> d_ptrs;
-      scalar_t** p128[2] = {nullptr, nullptr};   // trtri_diag_vbatched outputs per side (128 layout)
+      std::vector<scalar_t*> h128[2];            // per side, per front: trtri_diag output (128 layout; host copy)
       std::vector<InvRound> rounds[2];
     };
     std::vector<InvLevel> inv;
@@ -932,10 +932,9 @@ namespace strumpack {
         L.f[i]->invL_ = base[0][nlay-1] + off[nlay-1][i];
         L.f[i]->invU_ = base[1][nlay-1] + off[nlay-1][i];
       }
-      std::size_t o_p128[2];
       for (int side=0; side<2; side++) {
-        o_p128[side] = ptrs.size();
-        for (std::size_t i=0; i<N; i++) ptrs.push_back(base[side][0] + off[0][i]);
+        V.h128[side].resize(N);
+        for (std::size_t i=0; i<N; i++) V.h128[side][i] = base[side][0] + off[0][i];
       }
       struct RO { std::size_t m_rB, c_s, c_2s, c_ld, c_sB, a, b, oa, ob, M, T, oX; int s, nblk, max_rB; };
       std::vector<RO> ro[2];
@@ -986,7 +985,6 @@ namespace strumpack {
       gpu::copy_host_to_device<scalar_t*>(V.d_ptrs, ptrs.data(), ptrs.size());
       int* di = V.d_ints; scalar_t** dp = V.d_ptrs;
       for (int side=0; side<2; side++) {
-        V.p128[side] = dp + o_p128[side];
         for (auto& r : ro[side]) {
           typename FactorCache::InvRound R;
           R.s = r.s; R.nblk = r.nblk; R.max_rB = r.max_rB;
@@ -1015,10 +1013,13 @@ namespace strumpack {
     if (verbose) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, st); }
     gpu::memset<scalar_t>(V.d_inv, 0, 2 * V.side_elems);
     for (int side=0; side<2; side++) {
-      gpu::magma::trtri_diag_vbatched
-        (side == 0 ? MagmaLower : MagmaUpper, side == 0 ? MagmaUnit : MagmaNonUnit,
-         L.max_d1_small, L.dev_d1_batch, (const scalar_t* const*)L.dev_F_batch, L.dev_ld1_batch,
-         V.p128[side], 1, N, handle);
+      // MAGMA's trtri_diag_vbatched returns wrong blocks (checked standalone, stock 2.10.0 too): one nonbatched
+      // call per front (~10 launches each, once per factorization)
+      for (magma_int_t i=0; i<N; i++) {
+        auto& f = *(L.f[i]);
+        gpu::magma::trtri_diag(side == 0 ? MagmaLower : MagmaUpper, side == 0 ? MagmaUnit : MagmaNonUnit,
+                               f.dim_sep(), f.F11_.data(), f.F11_.ld(), V.h128[side][i], handle);
+      }
       for (auto& R : V.rounds[side]) {
         const int s = R.s;
         gpu::magma::lacpy_vbatched(MagmaFull, s, s, R.c_s, R.c_s, (const scalar_t* const*)R.a, R.c_s, R.oa, R.c_2s, R.nblk, handle);

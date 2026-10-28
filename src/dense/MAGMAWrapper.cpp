@@ -675,6 +675,30 @@ namespace strumpack {
            (magmaDoubleComplex**)dB_array, lddb, batchCount, get_magma_queue(h));
         get_last_error();
       }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const float* dA, magma_int_t ldda,
+                      float* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_strtri_diag(uplo, diag, n, (const float*)dA, ldda, (float*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const double* dA, magma_int_t ldda,
+                      double* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_dtrtri_diag(uplo, diag, n, (const double*)dA, ldda, (double*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const std::complex<float>* dA, magma_int_t ldda,
+                      std::complex<float>* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_ctrtri_diag(uplo, diag, n, (const magmaFloatComplex*)dA, ldda, (magmaFloatComplex*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const std::complex<double>* dA, magma_int_t ldda,
+                      std::complex<double>* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_ztrtri_diag(uplo, diag, n, (const magmaDoubleComplex*)dA, ldda, (magmaDoubleComplex*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
     } // end namespace magma
   } // end namespace gpu
 } // end namespace strumpack

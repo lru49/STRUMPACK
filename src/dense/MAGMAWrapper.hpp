@@ -266,6 +266,18 @@ namespace strumpack {
       void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
                           std::complex<double> const* const* dA_array, magma_int_t* ldda, std::complex<double>** dB_array, magma_int_t* lddb,
                           magma_int_t batchCount, Handle& h);
+      // S-INVDIAG: nonbatched block inversion (the vbatched variant of MAGMA 2.10.0 returns wrong blocks)
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const float* dA, magma_int_t ldda,
+                      float* dinvA, Handle& h);
+      // S-INVDIAG: nonbatched block inversion (the vbatched variant of MAGMA 2.10.0 returns wrong blocks)
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const double* dA, magma_int_t ldda,
+                      double* dinvA, Handle& h);
+      // S-INVDIAG: nonbatched block inversion (the vbatched variant of MAGMA 2.10.0 returns wrong blocks)
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const std::complex<float>* dA, magma_int_t ldda,
+                      std::complex<float>* dinvA, Handle& h);
+      // S-INVDIAG: nonbatched block inversion (the vbatched variant of MAGMA 2.10.0 returns wrong blocks)
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const std::complex<double>* dA, magma_int_t ldda,
+                      std::complex<double>* dinvA, Handle& h);
     } // end namespace magma
   } // end namespace gpu
 } // end namespace strumpack
