@@ -685,9 +685,12 @@ namespace strumpack {
     }
     scalar_t* fbase = dev_factors_->template as<scalar_t>();
     C.inv_ms = 0.; C.inv_resid = 0.;
-    // S-INVDIAG v2: the previous factorization's inversions must be done before F11 is overwritten (the memsets /
-    // gathers below run on the legacy default stream, which is ordered after comp_stream)
-    for (int l=0; l<int(C.inv.size()); l++) if (C.inv[l].on && C.inv_done[l]) C.inv_done[l]->wait(comp_stream);
+    // S-INVDIAG v2: the previous factorization's inversions must be done before F11 is overwritten. Host-side event
+    // wait on purpose (normally long complete): a cudaStreamWaitEvent of a blocking stream on an event of the
+    // non-blocking inversion stream leaves that stream with ~2x the per-launch latency for its whole life when the
+    // two map to different hardware queues (nsys: 1.5 vs 0.7 us between queued kernels; with the solve stream kept
+    // across refactorizations by S-CACHE-KEEP this cost every solve +0.2 ms).
+    for (int l=0; l<int(C.inv.size()); l++) if (C.inv[l].on && C.inv_done[l]) C.inv_done[l]->synchronize();
     for (int l=C.lvls-1; l>=0; l--) {
       auto& L = C.ldata[l];
       try {
@@ -1977,11 +1980,14 @@ namespace strumpack {
                   << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_p0).count() << std::endl;
     }
     // S-INVDIAG: the inverses of THIS factorization must be complete before the solve's stream touches them (the
-    // inversion stream is non-blocking and S-CACHE-KEEP keeps this cache across refactorizations: per epoch)
+    // inversion stream is non-blocking and S-CACHE-KEEP keeps this cache across refactorizations: per epoch).
+    // Host-side wait (see factors_on_device): a cudaStreamWaitEvent here put the kept solve stream into a slow
+    // launch mode (+0.2 ms per solve, window 121). The root's inversion tail (~0.8 ms after the last factorization
+    // kernel) is normally complete when the first solve starts.
     if (!C.inv_synced) {
       if (factor_cache_)
         for (int l=0; l<int(factor_cache_->inv.size()); l++)
-          if (factor_cache_->inv[l].on && factor_cache_->inv_done[l]) factor_cache_->inv_done[l]->wait(C.comp_stream);
+          if (factor_cache_->inv[l].on && factor_cache_->inv_done[l]) factor_cache_->inv_done[l]->synchronize();
       C.inv_synced = true;
     }
     C.n_solves++;
