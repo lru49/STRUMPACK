@@ -117,6 +117,9 @@ namespace strumpack {
     DenseMW_t F11_, F12_, F21_, F22_;
     std::vector<int> pivot_mem_;
     int* piv_ = nullptr;
+    // S-INVDIAG: explicit inverses of the NBxNB diagonal blocks of L11 / U11 (device, in the factor cache), or null
+    scalar_t* invL_ = nullptr;
+    scalar_t* invU_ = nullptr;
     std::unique_ptr<gpu::DeviceMemory<char>> dev_factors_ = nullptr;
     std::unique_ptr<gpu::DeviceMemory<char>> dev_Schur_ = nullptr;
 
@@ -156,6 +159,8 @@ namespace strumpack {
     mutable std::unique_ptr<SolveCache> solve_cache_;
     struct FactorCache;   // F-GATHER: structure cache across refactorizations (same sparsity)
     std::unique_ptr<FactorCache> factor_cache_;
+    void invdiag_plan(std::vector<LevelInfoMAGMA<scalar_t,integer_t>>& ldata);   // S-INVDIAG: allocate + batch meta (cache build)
+    void invdiag_build(int l, gpu::Handle& handle);                                 // S-INVDIAG: compute the inverses of level l (per factorization)
 
     using F_t::lchild_;
     using F_t::rchild_;

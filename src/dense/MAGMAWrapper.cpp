@@ -599,6 +599,106 @@ namespace strumpack {
         get_last_error();
       }
 
+
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               float const* const* dA_array, magma_int_t* ldda, float** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_strtri_diag_vbatched
+          (uplo, diag, nmax, n, (float const* const*)dA_array, ldda,
+           (float**)dinvA_array, resetozero, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          float const* const* dA_array, magma_int_t* ldda, float** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_slacpy_vbatched
+          (uplo, max_m, max_n, m, n, (float const* const*)dA_array, ldda,
+           (float**)dB_array, lddb, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               double const* const* dA_array, magma_int_t* ldda, double** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_dtrtri_diag_vbatched
+          (uplo, diag, nmax, n, (double const* const*)dA_array, ldda,
+           (double**)dinvA_array, resetozero, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          double const* const* dA_array, magma_int_t* ldda, double** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_dlacpy_vbatched
+          (uplo, max_m, max_n, m, n, (double const* const*)dA_array, ldda,
+           (double**)dB_array, lddb, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               std::complex<float> const* const* dA_array, magma_int_t* ldda, std::complex<float>** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_ctrtri_diag_vbatched
+          (uplo, diag, nmax, n, (magmaFloatComplex const* const*)dA_array, ldda,
+           (magmaFloatComplex**)dinvA_array, resetozero, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          std::complex<float> const* const* dA_array, magma_int_t* ldda, std::complex<float>** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_clacpy_vbatched
+          (uplo, max_m, max_n, m, n, (magmaFloatComplex const* const*)dA_array, ldda,
+           (magmaFloatComplex**)dB_array, lddb, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+
+      void trtri_diag_vbatched(magma_uplo_t uplo, magma_diag_t diag, magma_int_t nmax, magma_int_t* n,
+                               std::complex<double> const* const* dA_array, magma_int_t* ldda, std::complex<double>** dinvA_array,
+                               magma_int_t resetozero, magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_ztrtri_diag_vbatched
+          (uplo, diag, nmax, n, (magmaDoubleComplex const* const*)dA_array, ldda,
+           (magmaDoubleComplex**)dinvA_array, resetozero, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+      void lacpy_vbatched(magma_uplo_t uplo, magma_int_t max_m, magma_int_t max_n, magma_int_t* m, magma_int_t* n,
+                          std::complex<double> const* const* dA_array, magma_int_t* ldda, std::complex<double>** dB_array, magma_int_t* lddb,
+                          magma_int_t batchCount, Handle& h) {
+        if (!batchCount) return;
+        magmablas_zlacpy_vbatched
+          (uplo, max_m, max_n, m, n, (magmaDoubleComplex const* const*)dA_array, ldda,
+           (magmaDoubleComplex**)dB_array, lddb, batchCount, get_magma_queue(h));
+        get_last_error();
+      }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const float* dA, magma_int_t ldda,
+                      float* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_strtri_diag(uplo, diag, n, (const float*)dA, ldda, (float*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const double* dA, magma_int_t ldda,
+                      double* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_dtrtri_diag(uplo, diag, n, (const double*)dA, ldda, (double*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const std::complex<float>* dA, magma_int_t ldda,
+                      std::complex<float>* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_ctrtri_diag(uplo, diag, n, (const magmaFloatComplex*)dA, ldda, (magmaFloatComplex*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
+      void trtri_diag(magma_uplo_t uplo, magma_diag_t diag, magma_int_t n, const std::complex<double>* dA, magma_int_t ldda,
+                      std::complex<double>* dinvA, Handle& h) {
+        if (n <= 0) return;
+        magmablas_ztrtri_diag(uplo, diag, n, (const magmaDoubleComplex*)dA, ldda, (magmaDoubleComplex*)dinvA, get_magma_queue(h));
+        get_last_error();
+      }
     } // end namespace magma
   } // end namespace gpu
 } // end namespace strumpack
