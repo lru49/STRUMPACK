@@ -91,7 +91,7 @@ namespace strumpack {
     return (e && e[0]) ? std::atoi(e) : def;
   }
   static int graph_mode() {
-    static const int m = graph_env_int("STRUM_GRAPH", 0);
+    static const int m = graph_env_int("STRUM_GRAPH", 1);   // default ON since solve7 (window 125); STRUM_GRAPH=0 disables
     return m;
   }
   static bool graph_solve_on() {
