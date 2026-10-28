@@ -53,7 +53,8 @@ namespace strumpack { // these are all global variables
     REORDERING_ERROR,   /*!< The matrix reordering failed.          */
     ZERO_PIVOT,         /*!< A zero pivot was encountered.          */
     NO_CONVERGENCE,     /*!< The iterative solver did not converge. */
-    INACCURATE_INERTIA  /*!< Inertia could not be computed.         */
+    INACCURATE_INERTIA, /*!< Inertia could not be computed.         */
+    UNSUPPORTED         /*!< S2: the requested path (solve_device) is not available for this configuration. */
   };
 
   inline std::ostream& operator<<(std::ostream& os, ReturnCode& e) {
@@ -64,6 +65,7 @@ namespace strumpack { // these are all global variables
     case ReturnCode::ZERO_PIVOT:         os << "ZERO_PIVOT"; break;
     case ReturnCode::NO_CONVERGENCE:     os << "NO_CONVERGENCE"; break;
     case ReturnCode::INACCURATE_INERTIA: os << "INACCURATE_INERTIA"; break;
+    case ReturnCode::UNSUPPORTED:        os << "UNSUPPORTED"; break;
     }
     return os;
   }

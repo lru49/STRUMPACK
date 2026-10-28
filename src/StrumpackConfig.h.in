@@ -34,6 +34,8 @@
 #cmakedefine STRUMPACK_USE_OPENMP
 
 #cmakedefine STRUMPACK_USE_CUDA
+// S2 (magma-hpc F track): SparseSolver::solve_device / SparseSolverMixedPrecision::solve_device exist in this build
+#define STRUMPACK_HAVE_SOLVE_DEVICE 1
 #cmakedefine STRUMPACK_USE_HIP
 #cmakedefine STRUMPACK_HIP_PLATFORM_HCC
 #cmakedefine STRUMPACK_HIP_PLATFORM_NVCC

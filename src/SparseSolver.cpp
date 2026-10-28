@@ -389,6 +389,38 @@ namespace strumpack {
       }
   }
 
+  // S2 (magma-hpc, 2026-10-28): device-pointer solve on the caller's stream, the DIRECT / matching NONE /
+  // equilibration NONE fast path of solve_internal (S-HOST devperm branch) without the host staging and the
+  // host synchronisation. STRUM_SOLVE_DEVPERM=0 (which disables the S-HOST path) disables this one too.
+  template<typename scalar_t,typename integer_t> ReturnCode
+  SparseSolver<scalar_t,integer_t>::solve_device
+  (const scalar_t* d_b, scalar_t* d_x, CUstream_st* stream) {
+#if defined(STRUMPACK_USE_CUDA)
+    if (!this->reordered_) {
+      ReturnCode ierr = this->reorder();
+      if (ierr != ReturnCode::SUCCESS) return ierr;
+    }
+    if (!this->factored_) {
+      ReturnCode ierr = this->factor();
+      if (ierr != ReturnCode::SUCCESS) return ierr;
+    }
+    static const bool devperm = !(std::getenv("STRUM_SOLVE_DEVPERM") &&
+                                  std::atoi(std::getenv("STRUM_SOLVE_DEVPERM")) == 0);
+    if (!devperm || opts_.Krylov_solver() != KrylovSolver::DIRECT ||
+        opts_.matching() != MatchingJob::NONE ||
+        equil_.type != EquilibrationType::NONE || !d_b || !d_x)
+      return ReturnCode::UNSUPPORTED;
+    if (!tree()->multifrontal_solve_device
+        (d_b, d_x, std::size_t(matrix()->size()), 1, reordering()->iperm(), reordering()->perm(),
+         static_cast<void*>(stream)))
+      return ReturnCode::UNSUPPORTED;
+    Krylov_its_ = 0;
+    return ReturnCode::SUCCESS;
+#else
+    return ReturnCode::UNSUPPORTED;
+#endif
+  }
+
   template<typename scalar_t,typename integer_t> ReturnCode
   SparseSolver<scalar_t,integer_t>::solve_internal
   (const DenseM_t& b, DenseM_t& x, bool use_initial_guess) {

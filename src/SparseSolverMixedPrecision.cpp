@@ -40,6 +40,9 @@
 #include "sparse/ordering/MatrixReordering.hpp"
 #include "sparse/EliminationTree.hpp"
 #include "iterative/IterativeSolvers.hpp"
+#if defined(STRUMPACK_USE_CUDA)
+#include "dense/CUDAWrapper.hpp"   // S2: cast_array
+#endif
 
 namespace strumpack {
 
@@ -60,7 +63,44 @@ namespace strumpack {
 
   template<typename factor_t,typename refine_t,typename integer_t>
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
-  ~SparseSolverMixedPrecision() = default;
+  ~SparseSolverMixedPrecision() {
+#if defined(STRUMPACK_USE_CUDA)
+    if (d_cast_b_) cudaFree(d_cast_b_);
+    if (d_cast_x_) cudaFree(d_cast_x_);
+#endif
+  }
+
+  template<typename factor_t,typename refine_t,typename integer_t> ReturnCode
+  SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::
+  solve_device(const refine_t* d_b, refine_t* d_x, CUstream_st* stream) {
+#if defined(STRUMPACK_USE_CUDA)
+    const std::size_t N = std::size_t(outer().size());
+    if (!N || !d_b || !d_x) return ReturnCode::UNSUPPORTED;
+    if (d_cast_n_ < N) {   // once (the first call, or a larger matrix): synchronous allocation
+      if (d_cast_b_) cudaFree(d_cast_b_);
+      if (d_cast_x_) cudaFree(d_cast_x_);
+      d_cast_b_ = d_cast_x_ = nullptr; d_cast_n_ = 0;
+      if (cudaMalloc(&d_cast_b_, N * sizeof(factor_t)) != cudaSuccess ||
+          cudaMalloc(&d_cast_x_, N * sizeof(factor_t)) != cudaSuccess) {
+        if (d_cast_b_) cudaFree(d_cast_b_);
+        d_cast_b_ = nullptr; cudaGetLastError();
+        return ReturnCode::UNSUPPORTED;
+      }
+      d_cast_n_ = N;
+    }
+    auto fb = static_cast<factor_t*>(d_cast_b_);
+    auto fx = static_cast<factor_t*>(d_cast_x_);
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    gpu::cast_array<refine_t,factor_t>(d_b, fb, N, s);
+    auto rc = solver_.solve_device(fb, fx, stream);
+    if (rc != ReturnCode::SUCCESS) return rc;
+    gpu::cast_array<factor_t,refine_t>(fx, d_x, N, s);
+    Krylov_its_ = 1;
+    return ReturnCode::SUCCESS;
+#else
+    return ReturnCode::UNSUPPORTED;
+#endif
+  }
 
   template<typename factor_t,typename refine_t,typename integer_t> ReturnCode
   SparseSolverMixedPrecision<factor_t,refine_t,integer_t>::

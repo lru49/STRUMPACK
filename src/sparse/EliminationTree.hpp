@@ -69,6 +69,12 @@ namespace strumpack {
     virtual bool multifrontal_solve_devperm(const DenseM_t& b, DenseM_t& x,
                                             const std::vector<integer_t>& iperm,
                                             const std::vector<integer_t>& perm) const;
+    // S2: see Front::multifrontal_solve_device (forwarded to the root front)
+    virtual bool multifrontal_solve_device(const scalar_t* d_b, scalar_t* d_x,
+                                           std::size_t n, int nrhs,
+                                           const std::vector<integer_t>& iperm,
+                                           const std::vector<integer_t>& perm,
+                                           void* stream) const;
 
     virtual void
     multifrontal_solve_dist(DenseM_t& x,

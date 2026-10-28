@@ -141,6 +141,15 @@ namespace strumpack {
     SPOptions<refine_t>& options() { return opts_; }
     const SPOptions<refine_t>& options() const { return opts_; }
 
+    /**
+     * S2: device-pointer solve of the FP32* series: the refine_t (double) rhs d_b is cast to factor_t on
+     * `stream` by a device kernel, the inner solver's solve_device runs on that stream, and the factor_t
+     * solution is cast back into d_x (refine_t) on the stream. ONE inner solve (no refinement), as a
+     * preconditioner application; no host staging or synchronisation. Returns ReturnCode::UNSUPPORTED when the
+     * inner solver cannot (see SparseSolver::solve_device).
+     */
+    ReturnCode solve_device(const refine_t* d_b, refine_t* d_x, CUstream_st* stream = nullptr);
+
     SparseSolver<factor_t,integer_t>& solver() { return solver_; }
     const SparseSolver<factor_t,integer_t>& solver() const { return solver_; }
 
@@ -158,6 +167,8 @@ namespace strumpack {
     const CSRMatrix<refine_t,integer_t>* ext_mat_ = nullptr;
     const CSRMatrix<refine_t,integer_t>& outer() const { return ext_mat_ ? *ext_mat_ : mat_; }
     SparseSolver<factor_t,integer_t> solver_;
+    // S2: device scratch of the casts (factor_t, N entries each), allocated on the first solve_device
+    void* d_cast_b_ = nullptr; void* d_cast_x_ = nullptr; std::size_t d_cast_n_ = 0;
     SPOptions<refine_t> opts_;
     int Krylov_its_ = 0;
   };

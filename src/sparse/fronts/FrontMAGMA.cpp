@@ -296,12 +296,21 @@ namespace strumpack {
   }
   template<typename scalar_t,typename integer_t>
   struct FrontMAGMA<scalar_t,integer_t>::SolveCache {
-    SolveCache(int nrhs, std::size_t rows)
-      : comp_stream(solve_legacy_stream() ? 2 : 0), handle(comp_stream), nrhs(nrhs), rows(rows) {}
+    // S2: own_stream forces a private blocking stream (device-pointer mode: the K solvers' solves must not share
+    // the legacy default stream, or they serialise); otherwise the window-121 default (legacy stream) applies
+    SolveCache(int nrhs, std::size_t rows, bool own_stream=false)
+      : comp_stream((own_stream || !solve_legacy_stream()) ? 0 : 2), handle(comp_stream), nrhs(nrhs), rows(rows), own_stream(own_stream) {
+      gpu_check(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
+      gpu_check(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
+    }
+    ~SolveCache() { cudaEventDestroy(ev_fork); cudaEventDestroy(ev_join); }
     gpu::Stream comp_stream;
     gpu::Handle handle;
+    // S2: fork / join of comp_stream with the caller's stream in the device-pointer solve (no host sync)
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     int nrhs;
     std::size_t rows;
+    bool own_stream = false;
     std::vector<LevelInfoMAGMA<scalar_t,integer_t>> ldata;
     std::vector<std::size_t> l_off;
     std::size_t Nmax = 0, Ntotal = 0, max_bupd_size = 0,
@@ -1727,8 +1736,35 @@ namespace strumpack {
    const std::vector<integer_t>& perm) const {
     if (!dev_factors_) return false;
     const std::size_t n = x.rows();
-    if (std::size_t(b.rows()) != n || b.cols() != x.cols() ||
-        iperm.size() != n || perm.size() != n ||
+    if (std::size_t(b.rows()) != n || b.cols() != x.cols()) return false;
+    if (!ensure_devperm(n, iperm, perm)) return false;
+    DevPermArgs dp{&b, devperm_->d_iperm, devperm_->d_perm};
+    gpu_solve(x, &dp);
+    return true;
+  }
+
+  // S2 (magma-hpc, 2026-10-28): device-pointer solve. d_b / d_x are n x nrhs (ld n) in device memory, the
+  // reordering is applied on the device as in the S-HOST path; the solve cache's stream is forked from
+  // `stream` and joined back into it (events), so the caller sees one stream-ordered operation and K solvers
+  // with K caller streams overlap. No host staging, no host synchronisation.
+  template<typename scalar_t,typename integer_t> bool
+  FrontMAGMA<scalar_t,integer_t>::multifrontal_solve_device
+  (const scalar_t* d_b, scalar_t* d_x, std::size_t n, int nrhs,
+   const std::vector<integer_t>& iperm, const std::vector<integer_t>& perm,
+   void* stream) const {
+    if (!dev_factors_ || !d_b || !d_x || nrhs < 1 || d_b == d_x) return false;
+    if (!ensure_devperm(n, iperm, perm)) return false;
+    DenseMW_t xw(n, nrhs, nullptr, n);   // shape only: the data never touches the host in this mode
+    DevPermArgs dp{nullptr, devperm_->d_iperm, devperm_->d_perm, d_b, d_x, stream};
+    gpu_solve(xw, &dp);
+    return true;
+  }
+
+  template<typename scalar_t,typename integer_t> bool
+  FrontMAGMA<scalar_t,integer_t>::ensure_devperm
+  (std::size_t n, const std::vector<integer_t>& iperm,
+   const std::vector<integer_t>& perm) const {
+    if (iperm.size() != n || perm.size() != n ||
         n > std::size_t(std::numeric_limits<int>::max())) return false;
     if (!devperm_ || devperm_->key_iperm != iperm.data() ||
         devperm_->key_perm != perm.data() || devperm_->n != n) {
@@ -1748,8 +1784,6 @@ namespace strumpack {
         gpu::copy_host_to_device<int>(D.d_perm, t.data(), n);
       }
     }
-    DevPermArgs dp{&b, devperm_->d_iperm, devperm_->d_perm};
-    gpu_solve(x, &dp);
     return true;
   }
 
@@ -1790,9 +1824,13 @@ namespace strumpack {
   template<typename scalar_t,typename integer_t> void
   FrontMAGMA<scalar_t,integer_t>::gpu_solve(DenseM_t& b, const DevPermArgs* dp) const {
     int nrhs = b.cols();
+    // S2: the device-pointer mode needs the cache on a private stream (not the legacy default stream the host
+    // path uses since window 121): a cache built for the host path is rebuilt once (structure only) on first use
+    const bool want_own = dp && dp->d_bin;
     if (!solve_cache_ || solve_cache_->nrhs != nrhs ||
-        solve_cache_->rows != std::size_t(b.rows()))
-      solve_cache_.reset(new SolveCache(nrhs, b.rows()));
+        solve_cache_->rows != std::size_t(b.rows()) ||
+        (want_own && !solve_cache_->own_stream))
+      solve_cache_.reset(new SolveCache(nrhs, b.rows(), want_own));
     auto& C = *solve_cache_;
     // first solve with this cache: build level info and metadata
     const bool fresh = C.ldata.empty();
@@ -2211,7 +2249,17 @@ namespace strumpack {
     // the compute stream. STRUM_RHS_PIN=0 restores the pageable copies.
     static const bool rhs_pin = !(std::getenv("STRUM_RHS_PIN") && std::atoi(std::getenv("STRUM_RHS_PIN")) == 0);
     const std::size_t nb_elems = std::size_t(b.rows()) * nrhs;
-    if (dp) {
+    // S2: device-pointer mode (no host staging): fork comp_stream from the caller's stream, gather the rhs
+    // straight from the caller's buffer; at the end the solution is gathered into the caller's buffer and the
+    // caller's stream joins comp_stream. Everything below runs on comp_stream (or on blocking streams ordered
+    // against it); the caller's stream itself carries no work of the solve.
+    const bool dev_io = dp && dp->d_bin;
+    const cudaStream_t caller = dev_io ? static_cast<cudaStream_t>(dp->stream) : nullptr;
+    if (dev_io) {
+      gpu_check(cudaEventRecord(C.ev_fork, caller));
+      gpu_check(cudaStreamWaitEvent(gpu::get_cuda_stream(C.comp_stream), C.ev_fork, 0));
+      gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, dp->d_bin, d_b, dp->d_iperm);
+    } else if (dp) {
       // S-HOST (magma-hpc, 2026-10-27): the right-hand side arrives RAW; stage it pinned, upload it and apply the
       // sparse reordering on the device, d_b(i,:) = braw(iperm[i],:), instead of the host pass in transform_b.
       const DenseM_t& br = *dp->braw;
@@ -2239,7 +2287,10 @@ namespace strumpack {
     // restores them (A/B arm).
     static const bool solve_sync = std::getenv("STRUM_SOLVE_SYNC") && std::atoi(std::getenv("STRUM_SOLVE_SYNC")) == 1;
     // forward solve
-    if (C.gemvb_on) gpu::memset<scalar_t>(d_bupd_odd, 0, C.bupd_elems);   // S-GEMVBATCH: all levels' update buffers at once
+    // S-GEMVBATCH: all levels' update buffers at once. S2: stream-ordered on comp_stream (a synchronous cudaMemset
+    // runs on the legacy default stream, a barrier for every blocking stream: K concurrent solvers would serialise
+    // on it); same bytes, same ordering for the single-solver case.
+    if (C.gemvb_on) gpu_check(cudaMemsetAsync(d_bupd_odd, 0, C.bupd_elems * sizeof(scalar_t), gpu::get_cuda_stream(C.comp_stream)));
     for (int l=lvls-1; l>=0; l--) {
       if (solve_sync) gpu::synchronize_default_stream();
       std::string rname = "fwd l=" + std::to_string(l);
@@ -2424,7 +2475,18 @@ namespace strumpack {
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
       }
     }
-    if (dp) {
+    if (dev_io) {
+      // S2: undo the reordering straight into the caller's buffer, then join the caller's stream (no host sync)
+#if defined(STRUM_PLANT_DEVSOLVE)
+      // PLANT devsolve-gather-wrong-stream: the output gather is issued on the CALLER's stream instead of
+      // comp_stream (and the join is dropped): it races the solve still running on comp_stream, x is stale.
+      gpu::gather_rows_stream<scalar_t>(caller, b.rows(), nrhs, d_b, dp->d_xout, dp->d_perm);
+#else
+      gpu::gather_rows<scalar_t>(handle, b.rows(), nrhs, d_b, dp->d_xout, dp->d_perm);
+      gpu_check(cudaEventRecord(C.ev_join, gpu::get_cuda_stream(C.comp_stream)));
+      gpu_check(cudaStreamWaitEvent(caller, C.ev_join, 0));
+#endif
+    } else if (dp) {
       // S-HOST: undo the reordering on the device, x(i,:) = y(perm[i],:), then download (replaces transform_x)
       scalar_t* hb = C.h_b;
       scalar_t* d_braw = C.d_braw;
