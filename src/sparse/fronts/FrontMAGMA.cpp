@@ -294,6 +294,7 @@ namespace strumpack {
       max_work_mem = 0, Isize = 0;
     gpu::DeviceMemory<char> d_mem;
     gpu::HostMemory<char> h_mem;
+    gpu::HostMemory<scalar_t> h_b;   // S-RHSPIN: pinned staging for the right-hand side / solution (rows x nrhs)
     // Per-level batch meta-data (LevelInfoMAGMA::set_batch_data), one
     // private device region per level, so that it can be uploaded once
     // per cache instead of being re-uploaded (fwd + bwd) at every solve.
@@ -1417,7 +1418,19 @@ namespace strumpack {
     }
     C.n_solves++;
     // copy rhs, from pageable memory (input)
-    gpu::copy_host_to_device<scalar_t>(d_b, b);
+    // S-RHSPIN (magma-hpc, 2026-10-27): the 1.6 MB rhs went through a pageable cudaMemcpy each way (driver-side
+    // staging + a full device sync); now memcpy into a pinned buffer kept in the solve cache and an async copy on
+    // the compute stream. STRUM_RHS_PIN=0 restores the pageable copies.
+    static const bool rhs_pin = !(std::getenv("STRUM_RHS_PIN") && std::atoi(std::getenv("STRUM_RHS_PIN")) == 0);
+    const std::size_t nb_elems = std::size_t(b.rows()) * nrhs;
+    if (rhs_pin) {
+      if (C.h_b.size() < nb_elems) C.h_b = gpu::HostMemory<scalar_t>(nb_elems);
+      scalar_t* hb = C.h_b;
+      if (b.ld() == b.rows()) std::copy(b.data(), b.data() + nb_elems, hb);
+      else for (int j=0; j<nrhs; j++) std::copy(b.ptr(0, j), b.ptr(0, j) + b.rows(), hb + std::size_t(j) * b.rows());
+      gpu::copy_host_to_device_async<scalar_t>(d_b, hb, nb_elems, C.comp_stream);
+    } else
+      gpu::copy_host_to_device<scalar_t>(d_b, b);
 
     // S-NOSYNC (magma-hpc, 2026-10-27): the per-level host-side synchronizations below are not needed for
     // correctness: comp_stream is a blocking stream (cudaStreamCreate), so its kernels are ordered against the
@@ -1523,8 +1536,16 @@ namespace strumpack {
         gpu::extract_rhs
           (b.rows(), nrhs, N, &h_asmbl[l_off[l]], d_asmbl+l_off[l]);
     }
-    gpu::synchronize_default_stream();   // all levels issued; the D2H copy below is on the default stream anyway
-    gpu::copy_device_to_host<scalar_t>(b, d_b);
+    if (rhs_pin) {
+      scalar_t* hb = C.h_b;
+      gpu::copy_device_to_host_async<scalar_t>(hb, d_b, nb_elems, C.comp_stream);
+      C.comp_stream.synchronize();
+      if (b.ld() == b.rows()) std::copy(hb, hb + nb_elems, b.data());
+      else for (int j=0; j<nrhs; j++) std::copy(hb + std::size_t(j) * b.rows(), hb + std::size_t(j+1) * b.rows(), b.ptr(0, j));
+    } else {
+      gpu::synchronize_default_stream();
+      gpu::copy_device_to_host<scalar_t>(b, d_b);
+    }
     static const bool l2log = launch2_env("STRUM_LAUNCH2_LOG");
     static const bool l2ver = launch2_env("STRUM_LAUNCH2_VERIFY");
     if (l2log || l2ver)
